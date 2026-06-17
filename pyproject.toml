@@ -1,0 +1,28 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "penny"
+version = "0.1.0"
+description = "Regime-conditioned diffusion model for crypto limit order book generation"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "dvc[s3]>=3.67.1",
+    "numpy>=2.2.6",
+    "pandas>=2.3.3",
+    "scikit-learn>=1.7.2",
+    "scipy>=1.15.3",
+    "torch>=2.12.0",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/penny"]
+
+[dependency-groups]
+dev = [
+    "jupyter>=1.1.1",
+    "matplotlib>=3.10.9",
+    "ruff>=0.15.17",
+]
