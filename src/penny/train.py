@@ -72,8 +72,8 @@ def train_one_epoch(
         image = batch["image"].to(device)  # (B, 2, H, W)
         mask = batch["mask"].to(device)  # (B, 1, H, W)
         label = batch["label"].to(device)
-        mid_ref = batch["mid_ref"].to(device).float()
-        bwd = batch["bwd_smoothed"].to(device).float()
+        mid_ref = batch["mid_ref"].float().to(device)
+        bwd = batch["bwd_smoothed"].float().to(device)
         history = image * (1.0 - mask)
         b = image.shape[0]
 

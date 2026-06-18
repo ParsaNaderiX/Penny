@@ -31,8 +31,18 @@ from penny.model import TrendHead, build_unet, count_parameters  # noqa: E402
 
 
 def resolve_device(requested: str) -> torch.device:
-    if requested == "cuda" and not torch.cuda.is_available():
+    if requested == "cuda":
+        if torch.cuda.is_available():
+            return torch.device("cuda")
+        if torch.backends.mps.is_available():
+            logger.warning("cuda requested but unavailable; using mps")
+            return torch.device("mps")
         logger.warning("cuda requested but unavailable; using cpu")
+        return torch.device("cpu")
+    if requested == "mps":
+        if torch.backends.mps.is_available():
+            return torch.device("mps")
+        logger.warning("mps requested but unavailable; using cpu")
         return torch.device("cpu")
     return torch.device(requested)
 
@@ -41,7 +51,8 @@ def print_summary(config, meta, gamma, alpha, n_params, device, ckpt_dir) -> Non
     cb = meta["class_balance"]
     iv = config["snapshot_interval_sec"]
     total = meta["total_snapshots"]
-    n_days = config["train_days"] + config["val_days"] + config["test_days"]
+    approx_days = total * iv / 86400
+    tf, vf = config["train_frac"], config["val_frac"]
     f = config["unet_filters"]
     logger.info("Penny — LOB inpainting diffusion with trend loss")
     logger.info("  feature_mode      : {}", config["feature_mode"])
@@ -49,10 +60,10 @@ def print_summary(config, meta, gamma, alpha, n_params, device, ckpt_dir) -> Non
         "  exchange          : {}  |  pair: {}", config["exchange"], config["pair"]
     )
     logger.info(
-        "  snapshot_interval : {}s  |  total: {:,} snapshots ({} days)",
+        "  snapshot_interval : {}s  |  total: {:,} snapshots (~{:.1f} days)",
         iv,
         total,
-        n_days,
+        approx_days,
     )
     logger.info(
         "  window            : T_past={} ({} min)  T_future={} ({} min)",
@@ -67,7 +78,10 @@ def print_summary(config, meta, gamma, alpha, n_params, device, ckpt_dir) -> Non
         round(config["stride"] * iv / 60),
     )
     logger.info(
-        "  splits            : train={} val={} test={}",
+        "  splits            : {:.0%}/{:.0%}/{:.0%}  →  train={} val={} test={}",
+        tf,
+        vf,
+        1 - tf - vf,
         meta["counts"]["train"],
         meta["counts"]["val"],
         meta["counts"]["test"],

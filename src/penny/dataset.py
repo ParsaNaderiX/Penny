@@ -12,7 +12,6 @@ from __future__ import annotations
 from pathlib import Path
 
 import numpy as np
-import pandas as pd
 import torch
 from loguru import logger
 from torch.utils.data import Dataset
@@ -21,15 +20,16 @@ from . import features as feat
 from . import labels as lab
 
 
-def _day_split_bounds(
-    days: np.ndarray, train_days: int, val_days: int
+def _fraction_split_bounds(
+    n: int, train_frac: float, val_frac: float
 ) -> tuple[int, int]:
-    """Row indices ``(train_end, val_end)`` at the requested calendar-day edges."""
-    unique = np.array(sorted(pd.unique(days)))
-    train_last = unique[min(train_days, len(unique)) - 1]
-    val_last = unique[min(train_days + val_days, len(unique)) - 1]
-    train_end = int(np.searchsorted(days, train_last, side="right"))
-    val_end = int(np.searchsorted(days, val_last, side="right"))
+    """Snapshot indices for a temporal fraction-based split (no day snapping).
+
+    The window-start generator already skips day-straddling windows, so the
+    split point does not need to align with midnight.
+    """
+    train_end = int(n * train_frac)
+    val_end = int(n * (train_frac + val_frac))
     return train_end, val_end
 
 
@@ -101,9 +101,11 @@ class LOBImageDataset(Dataset):
 
 
 def _cache_path(config: dict) -> Path:
+    tf = int(config["train_frac"] * 100)
+    vf = int(config["val_frac"] * 100)
     name = (
         f"penny_{config['exchange']}_{config['pair']}_{config['feature_mode']}"
-        f"_T{config['T_total']}_s{config['stride']}.npz"
+        f"_T{config['T_total']}_s{config['stride']}_split{tf}-{vf}.npz"
     )
     return Path(config["cache_dir"]) / name
 
@@ -162,10 +164,10 @@ def build_datasets(config: dict):
         rows = feat.build_global_rows(snaps, trades, config)  # (N, R, 2)
         mid = feat.mid_series(snaps)
         days = snaps["time"].dt.normalize().to_numpy()
-        train_end, val_end = _day_split_bounds(
-            days, config["train_days"], config["val_days"]
-        )
         n = len(snaps)
+        train_end, val_end = _fraction_split_bounds(
+            n, config["train_frac"], config["val_frac"]
+        )
 
         normalizer = feat.RollingNormalizer(config)
         normalizer.fit(rows[:train_end])
