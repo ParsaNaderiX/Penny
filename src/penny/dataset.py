@@ -1,202 +1,234 @@
-"""Dataset construction for Penny.
+"""Dataset construction for Penny (spec sections 1, 2.7, 3).
 
-Builds the feature matrix once, splits it temporally by calendar day, fits the
-rolling normalizer on the training split, precomputes per-sample regime vectors
-and direction labels, and loads every tensor onto the configured device at
-construction time so training never touches the CPU (except for numpy metric
-conversion).
+Reads order-book/trade CSVs, builds the global row stream, splits strictly by
+calendar day (train/val/test = 6/2/1 days), slides ``T_total`` windows at
+``stride`` while skipping any window that straddles a day boundary, fits the
+normalizer and the OFI->price coefficient ``gamma`` on training data, calibrates
+the DeepLOB ``alpha`` for balanced classes, and caches everything to ``.npz``.
 """
 
 from __future__ import annotations
 
-import logging
+from pathlib import Path
 
 import numpy as np
 import pandas as pd
 import torch
+from loguru import logger
 from torch.utils.data import Dataset
 
-from . import features as feat_mod
-from .diffusion import Diffusion
-
-logger = logging.getLogger(__name__)
+from . import features as feat
+from . import labels as lab
 
 
-def _split_bounds(dates: np.ndarray, train_frac: float, val_frac: float) -> tuple[int, int]:
-    """Return row indices (train_end, val_end) aligned to calendar-day edges."""
-    unique_days = np.array(sorted(pd.unique(dates)))
-    n_days = len(unique_days)
-    n_train_days = max(int(round(train_frac * n_days)), 1)
-    n_val_days = max(int(round(val_frac * n_days)), 1)
-    train_last = unique_days[min(n_train_days, n_days) - 1]
-    val_last = unique_days[min(n_train_days + n_val_days, n_days) - 1]
-    train_end = int(np.searchsorted(dates, train_last, side="right"))
-    val_end = int(np.searchsorted(dates, val_last, side="right"))
+def _day_split_bounds(
+    days: np.ndarray, train_days: int, val_days: int
+) -> tuple[int, int]:
+    """Row indices ``(train_end, val_end)`` at the requested calendar-day edges."""
+    unique = np.array(sorted(pd.unique(days)))
+    train_last = unique[min(train_days, len(unique)) - 1]
+    val_last = unique[min(train_days + val_days, len(unique)) - 1]
+    train_end = int(np.searchsorted(days, train_last, side="right"))
+    val_end = int(np.searchsorted(days, val_last, side="right"))
     return train_end, val_end
 
 
-class PennyDataset(Dataset):
-    """Sliding-window dataset of (past, future) trajectory pairs.
+def _starts(lo: int, hi: int, t_total: int, stride: int, days: np.ndarray) -> list[int]:
+    """Window starts in ``[lo, hi)`` that fit and do not straddle a day (spec 1)."""
+    out = []
+    for s in range(lo, hi - t_total + 1, stride):
+        if days[s] == days[s + t_total - 1]:
+            out.append(s)
+    return out
 
-    Each sample spans ``2T`` consecutive snapshots: the first ``T`` form the
-    context (``past_seq``) and the next ``T`` form the target trajectory.  The
-    regime vector and direction label are derived from the first ``k`` steps of
-    the future window.  Diffusion noising is applied on the fly in
-    :meth:`__getitem__`.
-    """
+
+def _fit_gamma(rows: np.ndarray, mid: np.ndarray, config: dict) -> tuple[float, float]:
+    """OLS-through-origin slope of ``dmid`` on best-level OFI + its R^2 (user-chosen)."""
+    ofi = feat.best_level_ofi(rows, config)[1:]
+    dmid = np.diff(mid)
+    denom = float(np.sum(ofi * ofi))
+    if denom < 1e-12:
+        return 0.0, 0.0
+    gamma = float(np.sum(ofi * dmid) / denom)
+    pred = gamma * ofi
+    ss_res = float(np.sum((dmid - pred) ** 2))
+    ss_tot = float(np.sum((dmid - dmid.mean()) ** 2)) + 1e-12
+    return gamma, 1.0 - ss_res / ss_tot
+
+
+class LOBImageDataset(Dataset):
+    """Windows over the normalized row stream; pads to square in ``__getitem__``."""
 
     def __init__(
-        self,
-        feats: torch.Tensor,
-        regimes: torch.Tensor,
-        labels: torch.Tensor,
-        starts: list[int],
-        config: dict,
-        diffusion: Diffusion,
+        self, rows_norm: np.ndarray, starts: np.ndarray, meta: dict, config: dict
     ) -> None:
-        self.feats = feats  # (N, F) on device
-        self.regimes = regimes  # (n_samples, regime_dim) on device
-        self.labels = labels  # (n_samples,) on device
+        self.rows = rows_norm  # (N, R, 2) float32, normalized
         self.starts = starts
-        self.T = config["T"]
-        self.T_max = config["T_max"]
-        self.diffusion = diffusion
-        self.device = feats.device
+        self.t_total = config["T_total"]
+        self.t_past = config["T_past"]
+        self.n2 = 2 * config["n_levels"]
+        self.padded = config["padded_size"]
+        self.is_ofi = config["feature_mode"] == "ofi"
+        self.mask = torch.from_numpy(feat.build_mask(config)).permute(
+            2, 0, 1
+        )  # (1,H,W)
+        self.labels = meta["labels"]
+        self.l = meta["l"]
+        self.mid_ref = meta["mid_ref"]  # anchor (lob) or boundary (ofi)
+        self.bwd = meta["bwd_smoothed"]
+        self.true_mid = meta["true_mid"]  # (M, T_total)
 
     def __len__(self) -> int:
         return len(self.starts)
 
-    def __getitem__(self, j: int):
-        """Return ``(past, future_noisy, noise, t, regime, label, future_clean)``."""
-        i = self.starts[j]
-        T = self.T
-        past = self.feats[i : i + T]
-        future_clean = self.feats[i + T : i + 2 * T]
+    def __getitem__(self, idx: int) -> dict:
+        s = self.starts[idx]
+        window = self.rows[s : s + self.t_total]  # (T, R, 2)
+        img = np.transpose(window, (1, 0, 2)).copy()  # (R, T, 2)
+        if self.is_ofi:
+            img[: self.n2, 0, 0] = 0.0  # spec 2.3: no OFI at col 0
+        padded, _ = feat.pad_levels(img, self.padded)  # (H, W, 2)
+        image = torch.from_numpy(padded).permute(2, 0, 1)  # (2, H, W)
+        return {
+            "image": image,
+            "mask": self.mask,
+            "label": int(self.labels[idx]),
+            "l": float(self.l[idx]),
+            "mid_ref": float(self.mid_ref[idx]),
+            "bwd_smoothed": float(self.bwd[idx]),
+            "true_mid": torch.from_numpy(self.true_mid[idx]),
+        }
 
-        t = torch.randint(0, self.T_max, (1,), device=self.device).squeeze(0)
-        noise = torch.randn_like(future_clean)
-        ab = self.diffusion.alpha_bars[t]
-        future_noisy = torch.sqrt(ab) * future_clean + torch.sqrt(1.0 - ab) * noise
 
-        return (past, future_noisy, noise, t, self.regimes[j], self.labels[j], future_clean)
+def _cache_path(config: dict) -> Path:
+    name = (
+        f"penny_{config['exchange']}_{config['pair']}_{config['feature_mode']}"
+        f"_T{config['T_total']}_s{config['stride']}.npz"
+    )
+    return Path(config["cache_dir"]) / name
 
 
-def _regimes_and_labels(
-    starts: list[int],
-    mid: np.ndarray,
-    depth: np.ndarray,
-    ofi: np.ndarray,
-    T: int,
-    k: int,
-    alpha: float,
-) -> tuple[np.ndarray, np.ndarray]:
-    """Compute raw regime vectors and direction labels for each sample start."""
+def _window_meta(
+    starts: list[int], mid: np.ndarray, config: dict, alpha: float | None
+) -> dict:
+    """Per-window labels/mids; if ``alpha`` is None only ``l``/mids are filled."""
+    t_past, k = config["T_past"], config["label_k"]
     n = len(starts)
-    regimes = np.zeros((n, 4), dtype=np.float64)
-    labels = np.zeros(n, dtype=np.int64)
-    for idx, i in enumerate(starts):
-        f0 = i + T
-        seg = mid[f0 : f0 + k]
-        m_t = mid[i + T]
-        m_bar = np.mean(seg)
-        trend = (m_bar - m_t) / (m_t + 1e-12)
-        rets = np.diff(seg) / (seg[:-1] + 1e-12)
-        vol = float(np.std(rets)) if len(rets) else 0.0
-        liquidity = float(np.mean(depth[f0 : f0 + k]))
-        flow = float(np.mean(ofi[f0 : f0 + k]))
-        regimes[idx] = (trend, vol, liquidity, flow)
-        labels[idx] = 0 if trend > alpha else (2 if trend < -alpha else 1)
-    return regimes, labels
+    out = {
+        "l": np.zeros(n, np.float64),
+        "labels": np.zeros(n, np.int64),
+        "mid_ref": np.zeros(n, np.float64),
+        "bwd_smoothed": np.zeros(n, np.float64),
+        "true_mid": np.zeros((n, config["T_total"]), np.float64),
+    }
+    use_anchor = config["feature_mode"] == "lob"
+    for j, s in enumerate(starts):
+        win_mid = mid[s : s + config["T_total"]]
+        out["true_mid"][j] = win_mid
+        out["l"][j] = lab.compute_l(win_mid, t_past, k)
+        out["bwd_smoothed"][j] = lab.smoothed_backward_mid(win_mid, t_past, k)
+        out["mid_ref"][j] = win_mid[0] if use_anchor else win_mid[t_past - 1]
+        if alpha is not None:
+            out["labels"][j] = lab.label_from_l(out["l"][j], alpha)
+    return out
 
 
-def _make_starts(lo: int, hi: int, T: int, S: int, drop_first: int) -> list[int]:
-    """Valid window starts within ``[lo, hi)`` requiring ``2T`` room, strided ``S``."""
-    starts = list(range(lo, hi - 2 * T + 1, S))
-    return starts[drop_first:] if drop_first else starts
+def build_datasets(config: dict):
+    """Return ``(train_ds, val_ds, test_ds, normalizer, gamma, alpha, meta)``."""
+    cache = _cache_path(config)
+    Path(config["cache_dir"]).mkdir(parents=True, exist_ok=True)
 
-
-def build_datasets(config: dict, diffusion: Diffusion, device: torch.device):
-    """Build train/val/test datasets sharing one fitted normalizer.
-
-    Returns ``(train_ds, val_ds, test_ds, feature_columns, train_trend_sigma)``.
-    """
-    feats_df, raw_df, columns = feat_mod.build_features(config)
-    feats_df = feats_df.set_index("snapshot_time")
-    dates = feats_df.index.normalize().to_numpy()
-
-    train_end, val_end = _split_bounds(dates, config["train_frac"], config["val_frac"])
-    n = len(feats_df)
-    logger.info(
-        "temporal split: train=[0,%d) val=[%d,%d) test=[%d,%d)",
-        train_end,
-        train_end,
-        val_end,
-        val_end,
-        n,
-    )
-
-    normalizer = feat_mod.RollingZScoreNormalizer(config["rolling_window_days"])
-    train_df = feats_df.iloc[:train_end]
-    normalizer.fit(train_df, columns)
-
-    norm = np.zeros((n, len(columns)), dtype=np.float32)
-    norm[:train_end] = normalizer.transform_train(train_df, columns).to_numpy()
-    norm[train_end:] = normalizer.transform_frozen(
-        feats_df.iloc[train_end:], columns
-    ).to_numpy()
-    feats_tensor = torch.from_numpy(norm).to(device)
-
-    mid = raw_df["mid_raw"].to_numpy(dtype=np.float64)
-    depth = raw_df["depth_raw"].to_numpy(dtype=np.float64)
-    ofi = raw_df["ofi_raw"].to_numpy(dtype=np.float64)
-
-    T, S, k = config["T"], config["S"], config["k"]
-    if k > T:
-        raise ValueError(f"k={k} must be <= T={T}")
-
-    train_starts = _make_starts(0, train_end, T, S, 0)
-    val_starts = _make_starts(train_end, val_end, T, S, T)
-    test_starts = _make_starts(val_end, n, T, S, T)
-    logger.info(
-        "samples: train=%d val=%d test=%d",
-        len(train_starts),
-        len(val_starts),
-        len(test_starts),
-    )
-
-    tr_reg, tr_lab = _regimes_and_labels(train_starts, mid, depth, ofi, T, k, config["alpha"])
-    va_reg, va_lab = _regimes_and_labels(val_starts, mid, depth, ofi, T, k, config["alpha"])
-    te_reg, te_lab = _regimes_and_labels(test_starts, mid, depth, ofi, T, k, config["alpha"])
-
-    reg_mean = tr_reg.mean(axis=0)
-    reg_std = tr_reg.std(axis=0)
-    reg_std[reg_std == 0] = 1.0
-    train_trend_sigma = 1.0
-
-    def _norm_reg(r: np.ndarray) -> torch.Tensor:
-        return torch.from_numpy(((r - reg_mean) / reg_std).astype(np.float32)).to(device)
-
-    for name, lab in (("train", tr_lab), ("val", va_lab), ("test", te_lab)):
-        if len(lab):
-            counts = np.bincount(lab, minlength=config["num_classes"])
-            logger.info(
-                "%s label distribution (up/flat/down): %s", name, counts.tolist()
-            )
-
-    def _ds(starts, reg, lab):
-        return PennyDataset(
-            feats_tensor,
-            _norm_reg(reg),
-            torch.from_numpy(lab).to(device),
-            starts,
-            config,
-            diffusion,
+    if cache.exists():
+        logger.info("loading dataset cache {}", cache.name)
+        z = np.load(cache, allow_pickle=True)
+        rows_norm = z["rows_norm"]
+        starts = {s: z[f"starts_{s}"] for s in ("train", "val", "test")}
+        metas = {s: z[f"meta_{s}"].item() for s in ("train", "val", "test")}
+        normalizer = feat.RollingNormalizer.from_dict(config, z["norm"].item())
+        gamma, alpha = float(z["gamma"]), float(z["alpha"])
+    else:
+        exch, pair = config["exchange"], config["pair"]
+        base = Path("data") / f"{exch}_data"
+        snaps = feat.load_orderbook(
+            str(base / f"{pair}_orderbook.csv"), config["n_levels"]
         )
+        trades = (
+            feat.load_trades(str(base / f"{pair}_trades.csv"))
+            if config["feature_mode"] == "ofi"
+            else None
+        )
+        logger.info("loaded {} snapshots for {}/{}", len(snaps), exch, pair)
 
+        rows = feat.build_global_rows(snaps, trades, config)  # (N, R, 2)
+        mid = feat.mid_series(snaps)
+        days = snaps["time"].dt.normalize().to_numpy()
+        train_end, val_end = _day_split_bounds(
+            days, config["train_days"], config["val_days"]
+        )
+        n = len(snaps)
+
+        normalizer = feat.RollingNormalizer(config)
+        normalizer.fit(rows[:train_end])
+        rows_norm = normalizer.transform(rows)
+
+        gamma, r2 = _fit_gamma(rows[:train_end], mid[:train_end], config)
+        if config["feature_mode"] == "ofi":
+            logger.info("gamma={:.6g}  R^2={:.4f}", gamma, r2)
+            if r2 < 0.05:
+                logger.warning(
+                    "OFI->price R^2={:.4f} < 0.05; mid reconstruction is weak", r2
+                )
+
+        t_total, stride = config["T_total"], config["stride"]
+        starts = {
+            "train": _starts(0, train_end, t_total, stride, days),
+            "val": _starts(train_end, val_end, t_total, stride, days),
+            "test": _starts(val_end, n, t_total, stride, days),
+        }
+        logger.info("windows: {}", {k: len(v) for k, v in starts.items()})
+
+        # calibrate alpha on training l-values (spec 3.2)
+        train_meta_l = _window_meta(starts["train"], mid, config, alpha=None)
+        if config["label_alpha"] and config["label_alpha"] > 0:
+            alpha = float(config["label_alpha"])
+        else:
+            alpha = lab.calibrate_alpha(train_meta_l["l"])
+
+        metas = {s: _window_meta(starts[s], mid, config, alpha) for s in starts}
+        starts = {s: np.array(v, dtype=np.int64) for s, v in starts.items()}
+
+        np.savez_compressed(
+            cache,
+            rows_norm=rows_norm,
+            norm=normalizer.to_dict(),
+            gamma=gamma,
+            alpha=alpha,
+            **{f"starts_{s}": starts[s] for s in starts},
+            **{f"meta_{s}": metas[s] for s in metas},
+        )
+        logger.info("cached dataset -> {}", cache.name)
+
+    datasets = {
+        s: LOBImageDataset(rows_norm, starts[s], metas[s], config)
+        for s in ("train", "val", "test")
+    }
+    meta = {
+        "counts": {s: len(starts[s]) for s in starts},
+        "class_balance": _class_balance(metas["train"]["labels"]),
+        "level_starts": feat.level_starts(config),
+    }
     return (
-        _ds(train_starts, tr_reg, tr_lab),
-        _ds(val_starts, va_reg, va_lab),
-        _ds(test_starts, te_reg, te_lab),
-        columns,
-        train_trend_sigma,
+        datasets["train"],
+        datasets["val"],
+        datasets["test"],
+        normalizer,
+        gamma,
+        alpha,
+        meta,
     )
+
+
+def _class_balance(labels: np.ndarray) -> dict:
+    counts = np.bincount(labels, minlength=3)
+    frac = counts / max(counts.sum(), 1)
+    return {"down": float(frac[0]), "stationary": float(frac[1]), "up": float(frac[2])}

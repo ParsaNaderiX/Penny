@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-Penny extends DiffLOB, using an LSTM-integrated diffusion model to generate realistic, directionally consistent crypto limit order books. Trained on BTCIRT/USDTIRT data from Iranian crypto exchanges, it supports synthetic data augmentation and uncertainty-aware signal generation for market microstructure analysis.
+Penny is an **inpainting diffusion model** for limit order books, following *Painting the Market* (Backhouse et al., arXiv:2509.05107v1). It concatenates a past + future LOB window into a single 2-channel image and inpaints the future region with a 2D UNet (DDPM + DDIM/RePaint), plus an auxiliary DeepLOB trend-classification loss. Trained on BTCIRT data from Nobitex (Iranian crypto exchange).
 
 ## Environment
 
@@ -17,8 +17,12 @@ Penny extends DiffLOB, using an LSTM-integrated diffusion model to generate real
 # Install dependencies
 uv sync
 
-# Train + evaluate the Penny model (reads config.json, or pass a config path)
+# Train + evaluate (default configs/config.json = OFI mode; configs/config_lob.json = LOB mode)
 uv run python scripts/train_penny.py [configs/config.json]
+
+# Inference: trend signal from a past window
+uv run python scripts/infer_penny.py --checkpoint <ckpt_dir> \
+  --orderbook data/nobitex_data/BTCIRT_orderbook.csv [--trades ...]
 
 # DVC: pull / push data from the remote
 uv run dvc pull
@@ -27,27 +31,34 @@ uv run dvc push
 
 ## Penny Model
 
-`Penny` is a regime-conditioned DDPM diffusion model (temporal 1-D UNet with FiLM
-+ cross-attention conditioning) that generates future LOB trajectories, plus an
-auxiliary LSTM trend-classification head. Everything is driven by `config.json` —
-no hardcoded hyperparameters. Modules:
+Penny builds a `(2n+3, T_total, 2)` image per window (rows = LOB levels with the
+spread in the middle + 3 trade rows; channel 0 = flow/price, channel 1 = signed
+depth), pads it square, and feeds the UNet a 5-channel input (noisy image +
+zeroed-future history + inpainting mask). Everything is driven by the JSON config.
 
-- `features.py` — builds the per-snapshot feature matrix (F=56 for n_levels=10:
-  40 LOB-ladder + 6 LOB-summary + 4 extra microstructure + 6 trade-flow features)
-  and the rolling-zscore normalizer (fit on train, frozen for val/test).
-- `dataset.py` — temporal calendar-day split, sliding `2T`-snapshot windows
-  (past `T` + future `T`), per-sample regime vectors / direction labels. All
-  tensors are moved to the configured device at construction.
-- `diffusion.py` — linear-beta DDPM schedule, `forward_diffusion`, DDIM `sample`.
-- `model.py` — the `Penny` network and conditioning encoders.
-- `evaluate.py` — per-epoch validation + full test suite (KS, Wasserstein, ACF,
-  counterfactual validity).
-- `train.py` — entry point: logging, AdamW + warmup-cosine, early stopping.
+A `feature_mode` switch selects channel 0: **`ofi`** (per-level Cont OFI, the
+default) or **`lob`** (price offsets from the window mid-anchor). Modules under
+`src/penny/`:
 
-**Note:** the spec described the data as `data/nobitext_data/`, `bid_vol_*`, 10
-levels; the real files are `data/nobitex_data/`, `bid_volume_*`, 20 levels. The
-loader normalizes these names and uses the first `n_levels`. F=56 is reached by
-adding 4 microstructure features beyond the 52 enumerated in the spec.
+- `labels.py` — DeepLOB smoothed-mid trend label (`0=down,1=stationary,2=up`)
+  and `alpha` calibration for balanced classes.
+- `features.py` — global row stream (OFI/depth/trade features), square padding,
+  inpainting mask, and the frozen `RollingNormalizer` (fit on train only).
+- `dataset.py` — calendar-day split (6/2/1 days), stride sliding windows that
+  skip day-straddlers, `gamma` (OFI→price) fit, `alpha` calibration, `.npz` cache.
+- `diffusion.py` — linear-beta DDPM, `q_sample`, DDIM step, RePaint step, sampler.
+- `model.py` — `build_unet` (diffusers `UNet2DModel`), `TrendHead` (1→3 linear),
+  `painted_future_mid` (price channel for LOB, γ-integrated OFI for OFI mode).
+- `train.py` — per-epoch train (masked diffusion loss + timestep-weighted trend
+  loss via Tweedie `x0_hat`), val diffusion loss, subset label accuracy.
+- `evaluate.py` — test metrics: accuracy, macro-F1, confusion, trend-ratio
+  correlation, mid MAE, spread Wasserstein (LOB only).
+- `scripts/train_penny.py`, `scripts/infer_penny.py` — entry points.
+
+**OFI mode mid reconstruction:** the OFI image has no price channel, so the
+future mid is reconstructed by integrating best-level OFI scaled by a fitted
+coefficient `gamma` (OLS slope of Δmid on best-level OFI, frozen from train).
+The spread-Wasserstein metric is therefore LOB-only.
 
 ## Data
 
