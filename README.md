@@ -1,12 +1,12 @@
 # Penny
 
-Penny explores three complementary approaches for **price-direction forecasting on cryptocurrency limit order books (LOBs)**. All approaches share the same raw data, DeepLOB trend labels, and 70/15/15 temporal split; they differ in what they model and how:
+Penny explores three approaches for **price-direction forecasting on cryptocurrency limit order books (LOBs)**. All three share the same raw data, DeepLOB trend labels, and 70/15/15 temporal split; they differ in what they model and how:
 
-| Approach | Package | What it does |
-|---|---|---|
-| **Painting** | `src/painting/` | Treats the LOB window as a 2D image and *inpaints* the future region using a fine-tuned diffusion UNet (RePaint + DDIM). Generates probabilistic futures, reconstructs the mid-price, and votes on direction. |
-| **CSDI** | `src/csdi/` | Two-axis transformer (feature-axis + time-axis) that directly forecasts future mid-price returns from the multivariate LOB row stream. No diffusion, deterministic inference. |
-| **TimesFM** | `src/timesfm/` | Univariate forecaster: a fine-tuned TimesFM prior blended with a trainable residual transformer. Operates only on the mid-price series. Falls back to the residual-only transformer if the TimesFM package is unavailable. |
+| Approach | Package | Task | Output |
+|---|---|---|---|
+| **Painting** | `src/painting/` | Inpaint the future LOB image with a diffusion UNet; reconstruct mid-price; classify direction | Softmax probs `{down, stat, up}` via sampled futures |
+| **CSDI** | `src/csdi/` | Two-axis transformer over the full multivariate LOB past window → direct 3-class logits | Softmax probs `{down, stat, up}` |
+| **TimesFM** | `src/timesfm/` | Transformer over past mid-price returns (+ optional net OFI) → direct 3-class logits | Softmax probs `{down, stat, up}` |
 
 Trained on 10-second order-book snapshots of **BTC/IRT from Nobitex** (Iranian crypto exchange).
 
@@ -14,28 +14,128 @@ Trained on 10-second order-book snapshots of **BTC/IRT from Nobitex** (Iranian c
 
 ## Table of Contents
 
-1. [Data](#1-data)
-2. [Feature Extraction](#2-feature-extraction)
-3. [Image Construction (Painting only)](#3-image-construction-painting-only)
+1. [Features](#1-features)
+2. [Labels — DeepLOB Trend Direction](#2-labels--deeplob-trend-direction)
+3. [Data, Splitting, and Windowing](#3-data-splitting-and-windowing)
 4. [Normalization](#4-normalization)
-5. [Dataset Splitting and Windowing](#5-dataset-splitting-and-windowing)
-6. [DeepLOB Trend Labels](#6-deeplob-trend-labels)
-7. [OFI Mid-Price Reconstruction (Painting / OFI mode)](#7-ofi-mid-price-reconstruction-painting--ofi-mode)
-8. [Model Architectures](#8-model-architectures)
-9. [Diffusion Process (Painting only)](#9-diffusion-process-painting-only)
-10. [Training](#10-training)
-11. [Validation](#11-validation)
-12. [Test Evaluation](#12-test-evaluation)
-13. [Setup and Usage](#13-setup-and-usage)
-14. [SLURM](#14-slurm)
-15. [Configuration](#15-configuration)
-16. [Project Structure](#16-project-structure)
+5. [Models and Loss](#5-models-and-loss)
+6. [Training](#6-training)
+7. [Evaluation](#7-evaluation)
+8. [Setup and Usage](#8-setup-and-usage)
+9. [SLURM](#9-slurm)
+10. [Configuration](#10-configuration)
+11. [Project Structure](#11-project-structure)
+12. [References](#12-references)
 
 ---
 
-## 1. Data
+## 1. Features
 
-Raw market data for each exchange is stored under `data/` and tracked by DVC (not Git).
+### Raw data
+
+| File | Columns |
+|---|---|
+| `*_orderbook.csv` | `time`, `bid_price_i`, `bid_volume_i`, `ask_price_i`, `ask_volume_i` for i = 1…n_levels |
+| `*_trades.csv` | `trade_time`, `price`, `volume`, `direction` (buy/sell) |
+
+Snapshots are captured every 10 seconds. Default depth: **n_levels = 10** per side.
+
+---
+
+### Multivariate LOB row stream — used by Painting and CSDI
+
+Both approaches build a `(N_snapshots, R, 2)` feature tensor where **R = 2·n_levels + 3 = 23** rows and **2** channels.
+
+#### Row layout
+
+Rows run from the deepest bid (row 0) to the tightest spread at the centre, then out to the deepest ask:
+
+| Row range | Side | Order |
+|---|---|---|
+| 0 … n−1 | Bid | deepest (row 0) → best bid (row n−1) |
+| n … 2n−1 | Ask | best ask (row n) → deepest (row 2n−1) |
+| 2n, 2n+1, 2n+2 | Trades | trade summary rows |
+
+#### Channel 0 — flow (`feature_mode`)
+
+**OFI mode (default):** per-level **Cont Order Flow Imbalance** (Cont et al. 2014).
+
+For each level i at each snapshot:
+
+- **Bid OFI (`bofi_i`):** `+new_vol` if bid price improved (moved up), `+Δvol` if unchanged, `−prev_vol` if worsened. Positive = bid liquidity added.
+- **Ask OFI (`aofi_i`):** mirror logic (tightening ask = buying pressure). Positive = ask liquidity added.
+- First snapshot has no predecessor — OFI is forced to zero.
+
+**LOB mode:** channel 0 carries raw `bid_price_i` (bid rows) and `ask_price_i` (ask rows). No mid subtraction.
+
+#### Channel 1 — state
+
+- Bid rows: `+bid_volume_i` (resting depth, positive)
+- Ask rows: `−ask_volume_i` (resting depth, negative)
+- Trade rows (channel 1 only; channel 0 = 0):
+  - Row 2n: `log(1 + total_trade_volume)` in the preceding `snapshot_interval_sec` seconds
+  - Row 2n+1: buy-volume ratio (fraction of volume that was buyer-initiated; 0.5 if no trades)
+  - Row 2n+2: buy-count ratio (fraction of trade count that was buyer-initiated; 0.5 if no trades)
+
+#### Image construction (Painting only)
+
+The past window slice `(T_past, R, 2)` is transposed to `(R, T_past, 2)` and square-padded to `(R_padded, T_total, 2)` = `(256, 256, 2)` by repeating rows round-robin along the height axis. The mapping from original row index to padded row slice is stored as `level_starts`.
+
+Final image tensor: `(2, 256, 256)` — two channels, square.
+
+---
+
+### TimesFM features — used by TimesFM only
+
+TimesFM is a lightweight classifier. It does not use the full row stream.
+
+**mid-price series:** `mid[t] = (bid_price_1[t] + ask_price_1[t]) / 2`
+
+**Window-relative returns:** the model normalises by the last observed mid-price so the input is stationary:
+```
+past_returns[t] = past_mid[t] / past_mid[T_past − 1] − 1
+```
+The series always ends at 0. This makes the input price-scale invariant.
+
+**Net OFI (OFI mode only):** best-level net order flow imbalance per snapshot:
+```
+net_ofi = aofi_best − bofi_best
+```
+This is z-score normalised using training-split mean and std (stored in checkpoint for inference). In OFI mode the model receives `(past_returns, net_ofi)` as a 2-channel sequence; in LOB mode it receives only `past_returns`.
+
+---
+
+## 2. Labels — DeepLOB Trend Direction
+
+Following Ntakaris et al. (2018), each window receives a **3-class direction label** derived from the smoothed mid-price across the window boundary.
+
+### Trend ratio
+
+```
+bwd  = mean(mid[T_past − k : T_past])     # mean of last k past mids
+fwd  = mean(mid[T_past : T_past + k])     # mean of first k future mids
+l    = (fwd − bwd) / bwd                  # fractional price change
+```
+
+Default `label_k = 10` → 100-second smoothing on each side of the boundary.
+
+### Class assignment
+
+| Label | Condition | Integer |
+|---|---|---|
+| Down | l < −α | 0 |
+| Stationary | \|l\| ≤ α | 1 |
+| Up | l > α | 2 |
+
+### Alpha calibration
+
+`α` is set to the **33.3rd percentile of |l|** across all training windows. This produces approximately equal class frequencies (one third each). Alpha is frozen after training and saved in the checkpoint. Setting `label_alpha = −1` in the config triggers auto-calibration (recommended); any positive value overrides it.
+
+---
+
+## 3. Data, Splitting, and Windowing
+
+### Exchanges and pairs
 
 | Exchange | Pairs |
 |---|---|
@@ -45,201 +145,56 @@ Raw market data for each exchange is stored under `data/` and tracked by DVC (no
 | Tabdeal | BTCIRT, USDTIRT |
 | Ramzinex | BTC_IRT, USDT_IRT |
 
-IRT and TMN both denote Iranian Toman (different naming conventions per exchange).
+IRT and TMN both denote Iranian Toman (different naming conventions per exchange). Default training target: **Nobitex BTCIRT**.
 
-**Order-book snapshots** (`*_orderbook.csv`) contain a timestamp and up to 20 bid/ask price-volume levels per snapshot captured every 10 seconds. **Trade ticks** (`*_trades.csv`) contain each individual trade's timestamp, price, volume, and direction (buy/sell).
+### Temporal split
 
-The default training target is **BTCIRT on Nobitex**.
+Snapshots are divided by index with **no random shuffling**:
 
----
+| Split | Fraction | Purpose |
+|---|---|---|
+| Train | 70% | Feature fitting, model training |
+| Val | 15% | Early stopping, hyperparameter choice |
+| Test | 15% | Final reported metrics |
 
-## 2. Feature Extraction
+### Sliding windows
 
-The painting and CSDI packages both operate on a **multivariate row stream** of shape `(N, R, 2)`, where N is the number of snapshots, R = 2n + 3 is the number of rows (n = 10 LOB levels per side + 3 trade rows), and 2 is the channel count.
+Within each split, windows of length `T_total = T_past + T_future` are extracted every `stride` snapshots. With the default `stride = 5` (50 seconds), consecutive windows overlap heavily, multiplying the number of training examples significantly.
 
-TimesFM is univariate and only uses the **mid-price series** `(best_bid + best_ask) / 2`.
+**Day-boundary skipping:** any window whose first and last snapshot fall on different calendar days is discarded to avoid spanning midnight.
 
-### Row layout
+Default window sizes: **T_past = 156** (26 min), **T_future = 100** (17 min), **T_total = 256** (43 min).
 
-Rows are indexed 0 to R−1 with the tightest spread at the centre:
-
-- Rows **0 to n−1**: bid levels, deepest at row 0, best bid at row **n−1**.
-- Rows **n to 2n−1**: ask levels, best ask at row **n**, deepest at row **2n−1**.
-- Rows **2n, 2n+1, 2n+2**: trade-feature rows (channel 1 only; channel 0 = 0).
-
-### Channel 0 — flow (`feature_mode` switch)
-
-**OFI mode (default):** per-level Cont Order Flow Imbalance (Cont et al. 2013).
-
-- **Bid level i (`bofi`):** if the bid price improved (moved up) → +new_volume; if unchanged → +Δvolume; if worsened → −previous_volume.  Positive = bid liquidity added.
-- **Ask level i (`aofi`):** mirror logic, stored buy-positive (tightening ask = buying pressure).
-- **Net best-level OFI** = `aofi_best − bofi_best` (used for mid-price reconstruction and the γ fit).
-- The first snapshot has no predecessor: OFI is set to zero.
-
-**LOB mode:** raw bid/ask prices. Row rb carries `bid_price_i`, row ra carries `ask_price_i`. No mid subtraction.
-
-### Channel 1 — state
-
-Resting signed depth: +volume for bids, −volume for asks. For trade rows, channel 1 carries:
-
-1. `log(1 + total_volume)` of all trades in the preceding `snapshot_interval_sec` seconds.
-2. Buy-volume ratio (fraction of volume that was buyer-initiated; 0.5 if no trades).
-3. Buy-count ratio (fraction of trade count that was buyer-initiated; 0.5 if no trades).
-
----
-
-## 3. Image Construction (Painting only)
-
-### From row stream to image
-
-For each sliding window of T_total consecutive snapshots, the row stream slice of shape `(T_total, R, 2)` is transposed to `(R, T_total, 2)`. The first T_past columns are the observed past; the last T_future columns are the inpainted target.
-
-Default: **T_past = 156** (≈ 26 min), **T_future = 100** (≈ 17 min), **T_total = 256** (≈ 43 min).
-
-In OFI mode the channel-0 value at column 0 is forced to zero (no predecessor at the window boundary).
-
-#### OFI mode — feature image layout
-
-```mermaid
-block-beta
-  columns 3
-  rl(["Row axis  (R = 23)"]):1
-  past(["PAST — 156 cols  (mask = 0, known)"]):1
-  future(["FUTURE — 100 cols  (mask = 1, inpainted)"]):1
-
-  bid_label["Bid levels\nrow 0 → 9\n(deepest → best bid)"]:1
-  bid_past["Ch 0  bofi per level  (bid liquidity added)\nCh 1  resting depth  +volume"]:1
-  bid_fut["Ch 0  ░░ generated ░░\nCh 1  ░░ generated ░░"]:1
-
-  sp["── best bid (row 9)  │  best ask (row 10) ── spread centre"]:3
-
-  ask_label["Ask levels\nrow 10 → 19\n(best ask → deepest)"]:1
-  ask_past["Ch 0  aofi per level  (ask liquidity added)\nCh 1  resting depth  −volume"]:1
-  ask_fut["Ch 0  ░░ generated ░░\nCh 1  ░░ generated ░░"]:1
-
-  tr_label["Trade rows\n20, 21, 22"]:1
-  tr_past["Ch 0  0\nCh 1  log-vol  |  buy-vol%  |  buy-cnt%"]:1
-  tr_fut["Ch 0  ░░ generated ░░\nCh 1  ░░ generated ░░"]:1
-```
-
-#### LOB mode — feature image layout
-
-```mermaid
-block-beta
-  columns 3
-  rl(["Row axis  (R = 23)"]):1
-  past(["PAST — 156 cols  (mask = 0, known)"]):1
-  future(["FUTURE — 100 cols  (mask = 1, inpainted)"]):1
-
-  bid_label["Bid levels\nrow 0 → 9\n(deepest → best bid)"]:1
-  bid_past["Ch 0  bid_price_i  (raw price)\nCh 1  resting depth  +volume"]:1
-  bid_fut["Ch 0  ░░ generated ░░\nCh 1  ░░ generated ░░"]:1
-
-  sp["── best bid (row 9)  │  best ask (row 10) ── spread centre"]:3
-
-  ask_label["Ask levels\nrow 10 → 19\n(best ask → deepest)"]:1
-  ask_past["Ch 0  ask_price_i  (raw price)\nCh 1  resting depth  −volume"]:1
-  ask_fut["Ch 0  ░░ generated ░░\nCh 1  ░░ generated ░░"]:1
-
-  tr_label["Trade rows\n20, 21, 22"]:1
-  tr_past["Ch 0  0\nCh 1  log-vol  |  buy-vol%  |  buy-cnt%"]:1
-  tr_fut["Ch 0  ░░ generated ░░\nCh 1  ░░ generated ░░"]:1
-```
-
-### Square padding
-
-The UNet requires a square input. Since R = 23 ≪ T_total = 256, each row is repeated along the height axis (round-robin, so some rows get one extra repeat) until the padded height reaches `padded_size = 256`. The mapping from original row index to padded slice is stored as `level_starts`.
-
-Final image tensor: `(2, 256, 256)` — two channels, height 256, width 256.
-
-### Inpainting mask
-
-A binary mask `(1, 256, 256)` marks the future region: all columns ≥ T_past are set to 1 (generate), all columns < T_past are set to 0 (re-paste known data). The mask is constant across windows.
+> **Why stride matters:** With 104 k snapshots and 70% for training, `stride = 30` yields only ~2 400 training windows — too few for a transformer. `stride = 5` yields ~14 000; `stride = 1` yields ~70 000. Use the smallest stride your compute budget allows.
 
 ---
 
 ## 4. Normalization
 
-Used by painting and CSDI (TimesFM operates in window-relative returns and needs no normalizer).
+**Painting and CSDI** use a `RollingNormalizer` — per-row, per-channel z-score fit on the last `norm_window_snapshots` (default 8 640 ≈ 1 day) of the training split, then frozen:
 
-A `RollingNormalizer` fits per-row, per-channel z-score statistics from the **last `norm_window_snapshots` rows of the training split** (default 8 640 ≈ 1 day), then freezes them:
-
-1. Compute `mean` and `std` per (row, channel) over the fitting window.
+1. Compute `mean` and `std` per `(row, channel)` over the fitting window.
 2. Z-score: `z = (x − mean) / std`.
-3. Clip at the 95th percentile of |z| observed over the full training set.
+3. Clip at the 95th percentile of `|z|` observed over the full training set.
 4. Cast to float32.
 
-No training statistics touch validation or test data — no look-ahead leakage. The normalizer is saved in every checkpoint so inference can restore it without re-processing the training data.
+No training statistics touch val or test data. The normalizer is saved in every checkpoint.
+
+**TimesFM** does not use the `RollingNormalizer`. Instead:
+- Mid-price: normalised inside the model as window-relative returns (no stored stats needed).
+- Net OFI: z-score normalised with training-split mean/std, stored in the checkpoint as `ofi_stats`.
 
 ---
 
-## 5. Dataset Splitting and Windowing
+## 5. Models and Loss
 
-### Fraction-based temporal split
+### Painting — Diffusion Inpainting
 
-Data is divided by snapshot index with **no random shuffling**. The first 70% of snapshots go to training, the next 15% to validation, and the last 15% to test. Split boundaries fall at exact index positions, so the ordering of real market time is always preserved.
+**What it does:** treats the LOB window as a 2-channel image, masks the future region, and inpaints it using a fine-tuned pretrained diffusion UNet (DDPM + DDIM + RePaint). The inpainted future image is decoded back to a mid-price series, from which a trend ratio `l` is computed and mapped to a direction via a TrendHead.
 
-### Sliding windows with stride
+**Backbone:** `UNet2DModel` loaded from `google/ddpm-celebahq-256`. Input/output channels are adapted (`3→5 in`, `3→2 out`) with `ignore_mismatched_sizes=True` — the first and last conv layers are re-initialised; all inner layers retain pretrained weights.
 
-Within each split, windows of length T_total are extracted every `stride` snapshots (default 30 = 5 minutes at 10 s). Consecutive windows overlap heavily (T_total − stride = 226 shared snapshots at the defaults), multiplying the number of training examples from ≈ 34 per day (non-overlapping) to ≈ 280 per day.
-
-**Day-boundary skipping:** any window whose first and last snapshot fall on different calendar days is discarded. This prevents the model from seeing a past region that spans midnight while the future spans the next day.
-
----
-
-## 6. DeepLOB Trend Labels
-
-Following Ntakaris et al. (2018), the trend label is derived from the **smoothed mid-price** on both sides of the window boundary.
-
-### Trend ratio
-
-```
-bwd = mean(mid[T_past − k : T_past])    # mean of last k past mids
-fwd = mean(mid[T_past : T_past + k])    # mean of first k future mids
-l   = (fwd − bwd) / bwd                 # fractional change
-```
-
-Default `label_k = 10` → 100-second smoothing on each side.
-
-### Class thresholding
-
-| Label | Condition | Class |
-|---|---|---|
-| Up | l > alpha | 2 |
-| Stationary | \|l\| ≤ alpha | 1 |
-| Down | l < −alpha | 0 |
-
-### Alpha calibration
-
-`alpha` is calibrated on training windows to produce approximately equal class frequencies (one-third each). It is set to the **33.3rd percentile of |l|** over all training windows. Alpha is frozen after fitting and applied unchanged to validation, test, and inference.
-
-Setting `label_alpha = -1` in the config triggers auto-calibration (recommended). Any positive value overrides calibration.
-
----
-
-## 7. OFI Mid-Price Reconstruction (Painting / OFI mode)
-
-In OFI mode, channel 0 carries flow quantities. The future mid-price series must be **reconstructed** from the generated OFI values for the trend label and evaluation metrics.
-
-**γ fitting:** OLS regression (through the origin) on the training split between Δmid and net best-level OFI (`aofi_best − bofi_best`). The slope γ converts net OFI to IRT of mid-price change. γ is frozen after training and saved in the checkpoint.
-
-**Reconstruction:**
-
-```
-mid[T_past + t] = mid[T_past] + γ · cumsum(net_ofi[T_past : T_past + t + 1])
-```
-
-The anchor is the real mid-price at the window boundary, so reconstruction is tied to observed reality. In LOB mode, the price channel is read directly and this step is skipped.
-
----
-
-## 8. Model Architectures
-
-### Painting: Fine-tuned pretrained UNet
-
-The backbone is a `UNet2DModel` from HuggingFace Diffusers loaded from a publicly available pretrained checkpoint (`google/ddpm-celebahq-256`). The pretrained weights provide a strong initialization for the convolutional encoder-decoder structure. Input/output channels are adapted (3→5 in, 3→2 out) using `ignore_mismatched_sizes=True` — the first and last convolutional layers are re-initialized while all inner layers retain their pretrained weights.
-
-**UNet input (5 channels):**
+**UNet inputs (5 channels):**
 
 | Channels | Content |
 |---|---|
@@ -247,9 +202,11 @@ The backbone is a `UNet2DModel` from HuggingFace Diffusers loaded from a publicl
 | 2–3 | History = x₀ × (1 − mask) — past known, future zeroed (2 ch) |
 | 4 | Inpainting mask (1 ch) |
 
-**UNet output (2 channels):** predicted noise ε̂ at the same spatial resolution.
+**UNet output:** predicted noise ε̂ `(2, 256, 256)`.
 
-The UNet is co-trained with a **TrendHead** — a single linear layer (6 parameters) mapping the scalar trend ratio `l_pred` to 3-class logits.
+**Diffusion process:**
+- **Forward (training):** linear-β DDPM, β₁ = 0.0001 → β₁₀₀₀ = 0.02. `xₜ = √ᾱₜ · x₀ + √(1−ᾱₜ) · ε`.
+- **Reverse (inference):** 50 deterministic DDIM steps with RePaint re-pasting of the known past at each step.
 
 ```mermaid
 flowchart TD
@@ -283,14 +240,14 @@ flowchart TD
     eps["Predicted noise  ε̂  ·  (2 × 256 × 256)"]
     diff_loss["Masked diffusion loss\nMSE(ε̂, ε)  over future region only"]
     tweedie["Tweedie estimate\nx̂₀  =  (xₜ − √(1−ᾱₜ)·ε̂) / √ᾱₜ"]
-    mid_rec["Painted future mid\nLOB: (best_bid + best_ask) / 2\nOFI: boundary_mid + cumsum(net_OFI) × γ"]
+    mid_rec["Painted future mid\nLOB: (best_bid + best_ask) / 2\nOFI: boundary_mid + γ · cumsum(net_OFI)"]
     l_pred["l_pred  =  (mean fwd k  −  bwd) / bwd"]
 
     subgraph th["Trend Head  (6 params)"]
         fc["Linear 1 → 3  →  class logits"]
     end
 
-    wce["Weighted cross-entropy\nw(t) = (1 − t/T_max)²  ·  CE(logits, label)"]
+    wce["Timestep-weighted cross-entropy\nw(t) = (1 − t/T_max)²  ·  CE(logits, label)"]
     total["Total loss  =  L_diff  +  λ · L_trend"]
 
     x0 --> xt
@@ -307,144 +264,157 @@ flowchart TD
     wce --> total
 ```
 
+**OFI mode mid reconstruction:** channel 0 carries OFI, not prices. The future mid is recovered by integrating the generated net best-level OFI scaled by a coefficient γ (OLS slope of Δmid on net OFI, fit on training and frozen). In LOB mode the price channel is read directly.
+
+**Loss:**
+```
+L_diff  = (1 / |future pixels|) · Σ_{future} (ε̂ − ε)²     # masked, future region only
+L_trend = w(t) · CE(TrendHead(l_pred), label)               # w(t) = (1 − t/T_max)²
+L       = L_diff + λ · L_trend                              # λ = 0.5
+```
+
+The timestep weight `w(t)` suppresses the trend gradient when t is large (high noise, low signal in x̂₀). At inference, `n_samples` futures are generated and the modal label is returned.
+
 ---
 
-### CSDI: Two-Axis Transformer
+### CSDI — Multivariate Transformer Classifier
 
-CSDI (Tashiro et al. 2021) interleaves a **time-axis transformer** (captures temporal patterns across T_past steps) with a **feature-axis transformer** (captures cross-level correlations across 2R feature rows). The model is a deterministic encoder — no diffusion, no sampling at inference.
+**What it does:** takes the full multivariate LOB past window and classifies direction directly — no price forecasting, no diffusion.
 
-**Input:** `(B, 2R, T_past)` — all channels and LOB rows over the past window, normalized.  
-**Output:** `(B, T_future)` — predicted future mid-price returns relative to the window boundary.
+**Input:** `(B, 2R, T_past)` — all 2·R = 46 feature rows (2 channels × 23 rows) over the T_past past snapshots, z-score normalised.
 
-Each `TwoAxisBlock` applies time-axis multi-head attention → feature-axis multi-head attention → feed-forward network with residual connections and layer normalization. CSDI-specific hyperparameters: `csdi_channels`, `csdi_layers`, `csdi_heads`, `csdi_diff_emb`, `csdi_time_emb`, `csdi_feature_emb`.
+**Output:** `(B, 3)` class logits.
+
+**Architecture:** a stack of `csdi_layers` `TwoAxisBlock`s, each applying:
+1. **Time-axis multi-head attention** — across the T_past time dimension for each feature row
+2. **Feature-axis multi-head attention** — across the 2R feature rows at each time step
+3. Group norm + residual (scaled by 1/√2)
+
+After the final block, the tensor is mean-pooled over both the feature and time dimensions to a `(B, C)` vector, then passed through a 2-layer MLP head to produce `(B, 3)` logits.
 
 ```mermaid
 flowchart LR
-    inp["Past window\n(B, 2R, T_past)"]
-    proj["Input projection\n→ (B, 2R, T_past, C)"]
-    b1["TwoAxisBlock 1\ntime-attn + feature-attn"]
-    b2["TwoAxisBlock 2"]
+    inp["Past window\n(B, 2R, T_past)\nnormalised"]
+    proj["Conv1d projection\n→ (B, C, 2R, T_past)"]
+    pe["+ time PE\n+ feature embedding"]
+    b1["TwoAxisBlock 1\ntime-attn → feature-attn → norm"]
     bn["TwoAxisBlock N"]
-    pool["Mean over rows and channels\n→ (B, T_past, C)"]
-    head["MLP head  → (B, T_future)"]
-    trend["TrendHead  (6 params)\nl_pred → 3-class logits"]
+    pool["Global mean pool\n→ (B, C)"]
+    head["MLP head\nLinear → GELU → Linear\n→ (B, 3) logits"]
 
-    inp --> proj --> b1 --> b2 --> bn --> pool --> head
-    head --> trend
+    inp --> proj --> pe --> b1 --> bn --> pool --> head
 ```
+
+**Loss:**
+```
+L = CrossEntropy(logits, label)
+```
+No price regression. No TrendHead. No diffusion.
 
 ---
 
-### TimesFM: Pretrained Univariate Forecaster
+### TimesFM — Univariate Transformer Classifier
 
-**Input:** past mid-price series `(B, T_past)`.  
-**Output:** `(B, T_future)` future mid-price returns.
+**What it does:** classifies price direction from the past mid-price returns series. In OFI mode, best-level net OFI is added as a second input channel.
 
-The model has two components that are blended:
+**Input:**
+- `past_returns` `(B, T_past)` — window-relative mid-price returns (always)
+- `past_ofi` `(B, T_past)` — z-score normalised net OFI (OFI mode only)
 
-1. **TimesFM prior** — `google/timesfm-2.0-500m-pytorch`, a 500 M-parameter foundation model pre-trained on a large corpus of time series. If the `timesfm` package is unavailable, this component returns zeros (the residual trains from scratch).
-2. **Residual transformer** — a lightweight trainable transformer always present, regardless of TimesFM availability. It learns the residual between the prior's forecast and the true future.
+These are stacked to `(B, T_past, n_features)` where n_features = 2 (OFI) or 1 (LOB).
 
-The blend weight is a single learned scalar: `output = prior × blend + residual`.
+**Output:** `(B, 3)` class logits.
 
-The model is entirely univariate — it does not ingest LOB rows or OFI features. `feature_mode` is recorded in the config for logging parity with the other approaches but has no effect on the mid series.
+**Architecture:** a self-contained transformer encoder (no external pretrained prior):
+
+1. Linear projection: `(B, T_past, n_features)` → `(B, T_past, d)`
+2. Learnable positional embedding `(1, T_past, d)` added
+3. `timesfm_layers` standard `TransformerEncoderLayer`s (`batch_first=True`, GELU activation)
+4. Mean pooling over time: `(B, T_past, d)` → `(B, d)`
+5. MLP head: `Linear → GELU → Linear` → `(B, 3)` logits
+
+```mermaid
+flowchart LR
+    mid["past_mid  (B, T_past)"]
+    ofi["past_ofi  (B, T_past)\nOFI mode only"]
+    ret["window-relative returns\npast_mid / past_mid[:, −1] − 1"]
+    stack["stack features\n(B, T_past, 1 or 2)"]
+    proj["Linear projection\n→ (B, T_past, d)"]
+    pe["+ learnable pos embedding"]
+    enc["TransformerEncoder\nN layers"]
+    pool["mean over time\n→ (B, d)"]
+    head["MLP head\n→ (B, 3) logits"]
+
+    mid --> ret --> stack
+    ofi --> stack
+    stack --> proj --> pe --> enc --> pool --> head
+```
+
+**Loss:**
+```
+L = CrossEntropy(logits, label)
+```
+No price regression. No pretrained TimesFM prior. No blend parameter.
+
+In LOB mode (`feature_mode = "lob"`), only `past_returns` is used — the OFI channel is omitted.
 
 ---
 
-## 9. Diffusion Process (Painting only)
-
-### Forward process (DDPM)
-
-Linear noise schedule from `β₁ = 0.0001` to `β₁₀₀₀ = 0.02` over T_max = 1000 steps. The cumulative product `ᾱₜ = ∏(1 − βᵢ)` governs the forward diffusion:
-
-```
-xₜ = √ᾱₜ · x₀ + √(1 − ᾱₜ) · ε,    ε ~ N(0, I)
-```
-
-At t = 0 the image is almost clean; at t = T_max it is pure noise.
-
-### Reverse process — DDIM (inference)
-
-50 deterministic DDIM steps (linearly spaced from T_max−1 to 0). At each step the UNet predicts ε̂, the Tweedie formula recovers x̂₀, and the DDIM update steps to the previous timestep (η = 0):
-
-```
-x̂₀ = (xₜ − √(1 − ᾱₜ) · ε̂) / √ᾱₜ
-x_{t_prev} = √ᾱ_{t_prev} · x̂₀ + √(1 − ᾱ_{t_prev}) · ε̂
-```
-
-50 DDIM steps match the quality of 1000 DDPM steps at ≈ 20× lower cost.
-
-### RePaint inpainting
-
-At every reverse step, RePaint enforces the known-region constraint by re-pasting the real past columns with the noise level appropriate for t_prev:
-
-```
-known_noised = √ᾱ_{t_prev} · x₀_past + √(1 − ᾱ_{t_prev}) · ε_new
-x_{t_prev}  = mask · ddim_step + (1 − mask) · known_noised
-```
-
-mask = 1 marks the future (generated), mask = 0 marks the past (always re-pasted from real data). This keeps the generated future sharply conditioned on the observed market history.
-
----
-
-## 10. Training
-
-### Painting
-
-**Masked diffusion loss:**
-
-```
-L_diff = (1 / |future pixels|) · Σ_{future} (ε̂ − ε)²
-```
-
-Only the future region (mask = 1) contributes to the loss. The UNet is not penalized for noise predictions in the known past, which is re-pasted at inference anyway.
-
-**Trend loss:**
-
-After predicting ε̂, the Tweedie formula recovers x̂₀. The future mid-price is reconstructed from x̂₀ (price channel for LOB, OFI integration for OFI mode), and the trend ratio is computed from the reconstructed series. The trend head maps `l_pred` to 3-class logits; cross-entropy is weighted by `w(t) = (1 − t / T_max)²` so that the gradient is negligible when the UNet has almost no signal (large t near pure noise).
-
-**Combined loss:** `L = L_diff + λ · L_trend` with `λ = 0.5`.
-
-### CSDI and TimesFM
-
-**Price loss:** `L_price = MSE(pred_returns, target_returns)`, where `target_returns = true_mid[T_past:] / boundary − 1`.
-
-**Trend loss:** same TrendHead + cross-entropy; `l_pred` is derived directly from the predicted future mid-price.
-
-**Combined loss:** `L = L_price + λ · L_trend` with `λ = 0.5`.
+## 6. Training
 
 ### Optimizer and schedule (all approaches)
 
-**AdamW** with peak learning rate from config and weight decay 10⁻⁴. Gradients clipped to L2 norm 1.0. Schedule: linear warmup for `warmup_steps = 200` gradient steps, then cosine decay to 0.
+- **AdamW**, peak lr from config, weight decay 10⁻⁴
+- **Gradient clipping:** L2 norm ≤ 1.0
+- **Schedule:** linear warmup for `warmup_steps = 200` gradient steps, then cosine decay to 0
+- **Early stopping:** triggers after `patience` epochs without improvement on the validation metric
+
+### Early stopping metric
+
+| Approach | Metric watched |
+|---|---|
+| Painting | Masked diffusion loss (val) |
+| CSDI | Cross-entropy loss (val) |
+| TimesFM | Cross-entropy loss (val) |
+
+### Checkpoint
+
+Each run saves `best.pt` containing: `model` state dict, `config`, `alpha`, `epoch`, plus `normalizer` (painting/CSDI) or `ofi_stats` (TimesFM OFI mode).
 
 ---
 
-## 11. Validation
+## 7. Evaluation
 
-**Early stopping metric:** masked diffusion loss (painting) or price MSE (CSDI/TimesFM) on the full validation set with dropout disabled. The best checkpoint is saved and early stopping triggers after `patience` epochs without improvement.
+After training the best checkpoint is reloaded and evaluated on the held-out test split.
 
-**Label accuracy (monitoring only):** for painting, a random subset of `val_eval_windows = 50` windows is inpainted `n_samples = 20` times each epoch; the modal label is compared to ground truth. For CSDI/TimesFM, label accuracy is computed over the full validation set deterministically. This accuracy is logged each epoch but does **not** influence checkpointing.
+### Painting
+
+Generates `n_samples = 20` futures per test window via DDIM + RePaint, takes the modal label.
+
+| Metric | Description |
+|---|---|
+| Accuracy | Modal predicted label vs. ground truth |
+| Macro F1 | Unweighted mean of per-class F1 |
+| Confusion matrix | 3×3 true vs. predicted |
+| Mid-price MAE | Mean |reconstructed mid − real mid| over first k future steps |
+| Spread Wasserstein | W₁ between predicted and real spread distributions — **LOB mode only** |
+
+### CSDI and TimesFM
+
+Deterministic single pass through the classifier.
+
+| Metric | Description |
+|---|---|
+| Accuracy | Argmax of logits vs. ground truth |
+| Macro F1 | Unweighted mean of per-class F1 |
+| Confusion matrix | 3×3 true vs. predicted |
+| Mean probs per class | Average softmax probability for each class across the test set |
+
+**Random baseline:** ~33.3% accuracy, ~0.333 macro F1.
 
 ---
 
-## 12. Test Evaluation
-
-After training, the best checkpoint is reloaded and evaluated on the held-out test split. Painting samples `n_samples = 20` generated futures per test window; CSDI and TimesFM produce a single deterministic prediction.
-
-| Metric | Painting | CSDI | TimesFM |
-|---|---|---|---|
-| **Accuracy** | modal label vs. ground truth | predicted label vs. ground truth | predicted label vs. ground truth |
-| **Macro F1** | unweighted mean of per-class F1 | same | same |
-| **Confusion matrix** | 3×3 true vs. predicted | same | same |
-| **Trend-ratio Pearson r** | mean predicted l vs. true l | same | same |
-| **Mid-price MAE** | mean reconstructed mid vs. real mid over first k steps (IRT) | same | same |
-| **Spread Wasserstein** | W₁ between predicted and real spread distributions — **LOB only** | N/A | N/A |
-
-Random baseline: ≈ 33.3% accuracy, ≈ 0.333 macro F1.
-
----
-
-## 13. Setup and Usage
+## 8. Setup and Usage
 
 ### Install
 
@@ -455,119 +425,95 @@ uv sync --extra cu126
 # CUDA 12.8  (A100, H100)
 uv sync --extra cu128
 
-# CUDA 13.0  (Blackwell: RTX 50xx, B100)
-uv sync --extra cu130
-
 # CPU-only
 uv sync --extra cpu
 
 # Apple Silicon (MPS)
 uv sync --extra mps
-
-# Optional: enable the TimesFM pretrained prior
-uv sync --extra timesfm
 ```
 
-### Data
+### Pull data
 
 ```bash
-# Pull raw data from the Cloudflare R2 DVC remote
 uv run dvc pull
 ```
 
-### Training
+### Train
 
 ```bash
-# Painting (pretrained UNet, OFI mode)
+# Painting (pretrained UNet, OFI features)
 uv run python -m painting.train configs/painting/ofi.json
 
-# Painting (pretrained UNet, LOB mode)
+# Painting (pretrained UNet, LOB features)
 uv run python -m painting.train configs/painting/lob.json
 
-# CSDI (multivariate, OFI mode)
+# CSDI (multivariate LOB classifier, OFI features)
 uv run python -m csdi.train configs/csdi/ofi.json
 
-# CSDI (multivariate, LOB mode)
+# CSDI (multivariate LOB classifier, LOB features)
 uv run python -m csdi.train configs/csdi/lob.json
 
-# TimesFM (univariate, OFI config — feature_mode is recorded only)
+# TimesFM (mid-returns + net OFI classifier)
 uv run python -m timesfm.train configs/timesfm/ofi.json
 
-# TimesFM (univariate, LOB config)
+# TimesFM (mid-returns only classifier)
 uv run python -m timesfm.train configs/timesfm/lob.json
 ```
 
-Checkpoints are saved under `checkpoints/<approach>_<mode>_<timestamp>/best.pt`.
+Checkpoints are saved under `checkpoints/<approach>_<mode>_<timestamp>/`.
 
-### Inference
+### Infer
 
 ```bash
-# Painting — generates n_samples probabilistic futures and votes on direction
+# Painting — samples n_samples futures and votes on direction
 uv run python -m painting.infer \
   --checkpoint checkpoints/painting_pretrained_ofi_20260101_120000 \
   --orderbook data/nobitex_data/BTCIRT_orderbook.csv \
   [--trades data/nobitex_data/BTCIRT_trades.csv] \
-  [--n-samples 20] \
-  [--device cuda]
+  [--n-samples 20] [--device cuda]
 
-# CSDI — deterministic inference
+# CSDI — single forward pass
 uv run python -m csdi.infer \
   --checkpoint checkpoints/csdi_ofi_20260101_120000 \
   --orderbook data/nobitex_data/BTCIRT_orderbook.csv \
-  [--trades ...]
+  [--trades data/nobitex_data/BTCIRT_trades.csv]
 
-# TimesFM — deterministic inference
+# TimesFM — single forward pass
 uv run python -m timesfm.infer \
   --checkpoint checkpoints/timesfm_ofi_20260101_120000 \
   --orderbook data/nobitex_data/BTCIRT_orderbook.csv
 ```
 
+All three print:
+```
+label  : 2 (up)
+probs  : down=0.12  stat=0.23  up=0.65
+```
+
 ---
 
-## 14. SLURM
+## 9. SLURM
 
-All SLURM scripts live under `slurm/`. Adjust `--partition`, `--time`, and `--mem` to your cluster's naming conventions. Each script reads an optional `CONFIG` environment variable so you can override the config path at submission time without editing the script.
-
-### Submit a single job
+All scripts live under `slurm/`. Each reads an optional `CONFIG` environment variable to override the config path at submission time.
 
 ```bash
-# Painting — OFI mode
+# Submit individual jobs
 sbatch slurm/painting_ofi.slurm
-
-# Painting — LOB mode
 sbatch slurm/painting_lob.slurm
-
-# CSDI — OFI mode
 sbatch slurm/csdi_ofi.slurm
-
-# CSDI — LOB mode
 sbatch slurm/csdi_lob.slurm
-
-# TimesFM — OFI config
 sbatch slurm/timesfm_ofi.slurm
-
-# TimesFM — LOB config
 sbatch slurm/timesfm_lob.slurm
-```
 
-### Override config at submission
-
-```bash
+# Override config at submission
 CONFIG=configs/csdi/lob.json sbatch slurm/csdi_ofi.slurm
-```
 
-### Submit all six experiments at once
-
-```bash
+# Submit all six at once
 for script in slurm/*.slurm; do sbatch "$script"; done
-```
 
-### Monitor jobs
-
-```bash
-squeue -u "$USER"          # list your running jobs
-scancel <jobid>            # cancel a specific job
-seff <jobid>               # GPU/CPU/memory efficiency report after job ends
+# Monitor
+squeue -u "$USER"
+seff <jobid>
 ```
 
 ### Resource hints
@@ -576,49 +522,37 @@ seff <jobid>               # GPU/CPU/memory efficiency report after job ends
 |---|---|---|---|
 | Painting (batch=4) | ≥ 16 GB | 32 GB | 8–12 h (50 epochs) |
 | CSDI (batch=8) | ≥ 8 GB | 16 GB | 3–6 h (50 epochs) |
-| TimesFM (batch=16) | ≥ 16 GB (prior) | 24 GB | 5–8 h (80 epochs) |
-
-If the TimesFM prior does not fit in VRAM, set `timesfm_pretrained: false` in the config to use the residual transformer only.
-
-### Environment variables
-
-| Variable | Default | Description |
-|---|---|---|
-| `CONFIG` | approach-specific | Path to the JSON config file |
-| `VENV_PATH` | (unset) | If set, `$VENV_PATH/bin/activate` is sourced before running. Set when using a virtualenv instead of the system uv. |
+| TimesFM (batch=16) | ≥ 4 GB | 8 GB | 1–3 h (80 epochs) |
 
 ---
 
-## 15. Configuration
+## 10. Configuration
 
-All settings live in JSON files under `configs/<approach>/`. Fields common across all approaches:
+All settings live in JSON files under `configs/<approach>/`. Fields shared across all approaches:
 
 | Field | Default | Description |
 |---|---|---|
-| `feature_mode` | `"ofi"` | `"ofi"` (Cont OFI) or `"lob"` (raw prices). TimesFM ignores this for features; it is logged only. |
-| `exchange` | `"nobitex"` | Exchange name, used for data path construction |
+| `feature_mode` | `"ofi"` | `"ofi"` (Cont OFI) or `"lob"` (raw prices). TimesFM: `"ofi"` adds net OFI channel; `"lob"` uses mid-returns only. |
+| `exchange` | `"nobitex"` | Exchange name — used for data path |
 | `pair` | `"BTCIRT"` | Trading pair |
-| `n_levels` | `10` | LOB depth levels per side |
-| `snapshot_interval_sec` | `10` | Seconds between order-book snapshots |
-| `T_past` | `156` | Observed past window length (≈ 26 min at 10 s) |
-| `T_future` | `100` | Future window to forecast/inpaint (≈ 17 min at 10 s) |
-| `T_total` | `256` | Total window length = T_past + T_future |
-| `train_frac` | `0.70` | Fraction of snapshots for training |
-| `val_frac` | `0.15` | Fraction of snapshots for validation (remainder = test) |
-| `stride` | `30` | Snapshots between window starts (5 min at 10 s) |
-| `norm_window_snapshots` | `8640` | Rows used to fit the normalizer (≈ 1 day) |
-| `clip_percentile` | `0.95` | Outlier clip quantile of \|z\| |
-| `n_trade_rows` | `3` | Number of trade-feature rows |
-| `label_k` | `10` | Smoothing half-window for trend ratio (100 s each side) |
-| `label_alpha` | `-1` | Trend threshold; −1 = auto-calibrate for balanced thirds |
+| `n_levels` | `10` | LOB depth per side |
+| `snapshot_interval_sec` | `10` | Seconds between snapshots |
+| `T_past` | `156` | Past window length (26 min at 10 s) |
+| `T_future` | `100` | Future window length (17 min at 10 s) |
+| `T_total` | `256` | T_past + T_future |
+| `train_frac` | `0.70` | Fraction for training |
+| `val_frac` | `0.15` | Fraction for validation |
+| `stride` | `5` | Snapshots between window starts |
+| `n_trade_rows` | `3` | Trade-feature rows in the row stream |
+| `label_k` | `10` | Smoothing half-window for trend ratio (100 s per side) |
+| `label_alpha` | `−1` | Trend threshold; −1 = auto-calibrate |
 | `lr` | varies | Peak learning rate (AdamW) |
 | `weight_decay` | `1e-4` | AdamW weight decay |
-| `warmup_steps` | `200` | Gradient steps for linear warmup |
+| `warmup_steps` | `200` | Linear warmup gradient steps |
 | `grad_clip` | `1.0` | Gradient L2 norm clip |
 | `batch_size` | varies | Training batch size |
-| `epochs` | varies | Maximum training epochs |
+| `epochs` | varies | Max training epochs |
 | `patience` | `10` | Early stopping patience |
-| `lambda_trend` | `0.5` | Weight of trend loss vs. primary loss |
 | `device` | `"cuda"` | `"cuda"`, `"mps"`, or `"cpu"` |
 | `cache_dir` | `"data/cache"` | Directory for `.npz` dataset cache |
 | `checkpoint_root` | `"checkpoints"` | Root directory for checkpoints |
@@ -627,52 +561,52 @@ All settings live in JSON files under `configs/<approach>/`. Fields common acros
 
 | Field | Default | Description |
 |---|---|---|
-| `pretrained_model_id` | `"google/ddpm-celebahq-256"` | HuggingFace model ID for the pretrained UNet |
+| `pretrained_model_id` | `"google/ddpm-celebahq-256"` | HuggingFace UNet pretrained weights |
+| `norm_window_snapshots` | `8640` | Rows for fitting the RollingNormalizer (~1 day) |
+| `clip_percentile` | `0.95` | Outlier clip quantile of \|z\| |
 | `padded_size` | `256` | Square padding size for UNet input |
-| `beta_start` | `0.0001` | First β in linear DDPM schedule |
-| `beta_end` | `0.02` | Last β in linear DDPM schedule |
+| `beta_start` | `0.0001` | First β in DDPM schedule |
+| `beta_end` | `0.02` | Last β in DDPM schedule |
 | `T_max` | `1000` | Total diffusion timesteps |
-| `ddim_steps` | `50` | DDIM reverse steps at evaluation |
-| `dropout` | `0.1` | Dropout rate inside UNet blocks |
-| `n_samples` | `20` | Diffusion samples per window at evaluation |
-| `val_eval_windows` | `50` | Validation windows sampled for label accuracy each epoch |
+| `ddim_steps` | `50` | DDIM reverse steps at inference |
+| `dropout` | `0.1` | Dropout inside UNet blocks |
+| `lambda_trend` | `0.5` | Weight of L_trend vs. L_diff |
+| `n_samples` | `20` | Diffusion samples per window at test time |
+| `val_eval_windows` | `50` | Windows sampled for label accuracy each val epoch |
 
 **CSDI-specific:**
 
 | Field | Default | Description |
 |---|---|---|
-| `csdi_channels` | `64` | Internal channel width of each transformer block |
+| `norm_window_snapshots` | `8640` | Rows for fitting the RollingNormalizer |
+| `clip_percentile` | `0.95` | Outlier clip quantile |
+| `csdi_channels` | `64` | Internal channel width C |
 | `csdi_layers` | `4` | Number of TwoAxisBlock layers |
-| `csdi_heads` | `8` | Attention heads (time-axis and feature-axis) |
-| `csdi_diff_emb` | `128` | Diffusion-step embedding dimension (unused in deterministic mode; kept for parity) |
-| `csdi_time_emb` | `128` | Time positional embedding dimension |
-| `csdi_feature_emb` | `16` | Feature row embedding dimension |
+| `csdi_heads` | `8` | Attention heads (time and feature axes) |
 
 **TimesFM-specific:**
 
 | Field | Default | Description |
 |---|---|---|
-| `timesfm_pretrained` | `true` | Load the TimesFM pretrained prior (requires `timesfm` extra) |
-| `timesfm_repo` | `"google/timesfm-2.0-500m-pytorch"` | HuggingFace repo for the prior |
-| `timesfm_hidden` | `256` | Hidden size of the residual transformer |
-| `timesfm_heads` | `8` | Attention heads in the residual transformer |
-| `timesfm_layers` | `4` | Layers in the residual transformer |
+| `timesfm_hidden` | `256` | Hidden dimension d of the transformer |
+| `timesfm_heads` | `8` | Attention heads |
+| `timesfm_layers` | `4` | Number of encoder layers |
 
 ---
 
-## 16. Project Structure
+## 11. Project Structure
 
 ```
 configs/
   painting/
-    ofi.json             Pretrained UNet, OFI feature mode
-    lob.json             Pretrained UNet, LOB feature mode
+    ofi.json             Pretrained UNet, OFI features
+    lob.json             Pretrained UNet, LOB features
   csdi/
-    ofi.json             CSDI multivariate, OFI mode
-    lob.json             CSDI multivariate, LOB mode
+    ofi.json             Multivariate LOB classifier, OFI features
+    lob.json             Multivariate LOB classifier, LOB features
   timesfm/
-    ofi.json             TimesFM univariate, OFI config
-    lob.json             TimesFM univariate, LOB config
+    ofi.json             Mid-returns + net OFI classifier
+    lob.json             Mid-returns only classifier
 data/                    Raw CSV data (DVC-tracked, not in Git)
   nobitex_data/
     BTCIRT_orderbook.csv
@@ -687,39 +621,38 @@ slurm/
   timesfm_lob.slurm
 src/
   painting/
-    labels.py            DeepLOB trend ratio, alpha calibration
-    features.py          OFI/depth/trade row builder, padding, mask, RollingNormalizer
-    diffusion.py         DDPM schedule, q_sample, DDIM step, RePaint step + sampler
-    model.py             Fine-tuned UNetInpaintModel, TrendHead, mid reconstruction
-    dataset.py           Fraction split, sliding windows, gamma + alpha fit, cache
-    train.py             Train entry point: python -m painting.train <config>
-    evaluate.py          Test metrics (6 metrics incl. spread Wasserstein for LOB)
-    infer.py             RePaint inference: predict() → signal dict
+    labels.py            DeepLOB trend ratio and alpha calibration
+    features.py          OFI/depth/trade row builder, square padding, mask, RollingNormalizer
+    diffusion.py         DDPM schedule, q_sample, DDIM step, RePaint sampler
+    model.py             UNetInpaintModel (pretrained UNet2DModel), TrendHead, mid reconstruction
+    dataset.py           Fraction split, sliding windows, gamma + alpha fit, .npz cache
+    train.py             Entry point: python -m painting.train <config>
+    evaluate.py          Test metrics: accuracy, F1, confusion, mid MAE, spread W1 (LOB)
+    infer.py             RePaint inference → {label, label_name, probs}
   csdi/
     labels.py            Same DeepLOB labels
-    features.py          Same row-stream builder (no padding/mask)
-    dataset.py           ForecastDataset: (2R, T_past) tensors
-    model.py             CSDIForecastModel: two-axis transformer
-    train.py             Train entry point: python -m csdi.train <config>
-    evaluate.py          Test metrics (5 metrics)
-    infer.py             Deterministic forecast → signal dict
+    features.py          Same multivariate row-stream builder + RollingNormalizer
+    dataset.py           CSDIDataset: {past: (2, R, T_past), label: int}
+    model.py             CSDIClassifier: two-axis transformer → (B, 3) logits
+    train.py             Entry point: python -m csdi.train <config>
+    evaluate.py          Test metrics: accuracy, F1, confusion, mean probs
+    infer.py             Single-pass inference → {label, label_name, probs}
   timesfm/
     labels.py            Same DeepLOB labels
-    features.py          load_orderbook, mid_series (univariate only)
-    dataset.py           ForecastDataset: mid series tensors
-    model.py             TimesFMForecastModel: pretrained prior + residual
-    train.py             Train entry point: python -m timesfm.train <config>
-    evaluate.py          Test metrics (5 metrics)
-    infer.py             Deterministic forecast → signal dict
+    features.py          mid_series, net_ofi_series (best-level net OFI)
+    dataset.py           ForecastDataset: {past_mid, label, past_ofi?}; ofi_stats in cache
+    model.py             TimesFMClassifier: transformer over returns + OFI → (B, 3) logits
+    train.py             Entry point: python -m timesfm.train <config>
+    evaluate.py          Test metrics: accuracy, F1, confusion, mean probs
+    infer.py             Single-pass inference → {label, label_name, probs}
 ```
 
 ---
 
-## References
+## 12. References
 
 - Backhouse et al., *Painting the Market: A Generative Diffusion Model for LOB Simulation*, arXiv:2509.05107v1, 2025.
 - Tashiro et al., *CSDI: Conditional Score-based Diffusion Models for Probabilistic Time Series Imputation*, NeurIPS 2021.
-- Das et al., *A Decoder-Only Foundation Model for Time-Series Forecasting (TimesFM)*, ICML 2024.
 - Ntakaris et al., *Benchmark Dataset for Mid-Price Forecasting of Limit Order Book Data with Machine Learning Methods*, Journal of Forecasting, 2018.
 - Cont, Kukanov, Stoikov, *The Price Impact of Order Book Events*, Journal of Financial Econometrics, 2014.
 - Lugmayr et al., *RePaint: Inpainting using Denoising Diffusion Probabilistic Models*, CVPR 2022.
