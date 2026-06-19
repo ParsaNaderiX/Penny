@@ -5,11 +5,10 @@ build-backend = "hatchling.build"
 [project]
 name = "penny"
 version = "0.1.0"
-description = "Regime-conditioned diffusion model for crypto limit order book generation"
+description = "LOB direction forecasting: DeepLOB, JointDiffusion, and LOBTransformer on Binance crypto data"
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
-    "diffusers>=0.32.0",
     "dvc[s3]>=3.56.0",
     "loguru>=0.7.3",
     "numpy>=1.26.0,<3.0.0",
@@ -46,14 +45,14 @@ mps = [
     "torch==2.11.0",
     "torchvision==0.26.0",
 ]
-# Optional: TimesFM pretrained forecast backbone (model_type="timesfm").
-# Without it, the forecast family falls back to a from-scratch transformer.
-timesfm = [
-    "timesfm[torch]>=1.2.0",
-]
+
+[project.scripts]
+penny-deeplob   = "crypto.deeplob.train:main"
+penny-jointdiff = "crypto.jointdiff.train:main"
+penny-timesfm   = "crypto.timesfm.train:main"
 
 [tool.hatch.build.targets.wheel]
-packages = ["src/painting", "src/csdi", "src/timesfm"]
+packages = ["src/crypto"]
 
 [tool.uv.sources]
 torch = [

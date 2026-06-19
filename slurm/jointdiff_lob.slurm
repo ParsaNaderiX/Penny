@@ -1,11 +1,11 @@
 #!/bin/bash
-#SBATCH --job-name=penny-painting-ofi
+#SBATCH --job-name=penny-jointdiff-lob
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=4
 #SBATCH --mem=32G
 #SBATCH --gres=gpu:1
-#SBATCH --time=12:00:00
+#SBATCH --time=16:00:00
 #SBATCH -p gpu
 
 set -euo pipefail
@@ -13,7 +13,7 @@ set -euo pipefail
 ROOT_DIR="${SLURM_SUBMIT_DIR:-$(pwd)}"
 cd "$ROOT_DIR"
 
-echo "Penny painting OFI | host=$(hostname) | start=$(date)"
+echo "Penny JointDiffusion LOB | host=$(hostname) | start=$(date)"
 
 if command -v module >/dev/null 2>&1; then
   module purge || true
@@ -23,7 +23,7 @@ if [[ -n "${VENV_PATH:-}" ]]; then
   source "$VENV_PATH/bin/activate"
 fi
 
-CONFIG="${CONFIG:-configs/painting/ofi.json}"
-uv run python -m painting.train "$CONFIG"
+CONFIG="${CONFIG:-configs/crypto/jointdiff/btcusdt_lob.json}"
+uv run python -m crypto.jointdiff.train "$CONFIG"
 
 echo "done: $(date)"

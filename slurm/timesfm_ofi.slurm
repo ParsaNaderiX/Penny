@@ -3,9 +3,9 @@
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=4
-#SBATCH --mem=24G
+#SBATCH --mem=32G
 #SBATCH --gres=gpu:1
-#SBATCH --time=8:00:00
+#SBATCH --time=12:00:00
 #SBATCH -p gpu
 
 set -euo pipefail
@@ -23,7 +23,7 @@ if [[ -n "${VENV_PATH:-}" ]]; then
   source "$VENV_PATH/bin/activate"
 fi
 
-CONFIG="${CONFIG:-configs/timesfm/ofi.json}"
-uv run python -m timesfm.train "$CONFIG"
+CONFIG="${CONFIG:-configs/crypto/timesfm/btcusdt_ofi.json}"
+uv run python -m crypto.timesfm.train "$CONFIG"
 
 echo "done: $(date)"
