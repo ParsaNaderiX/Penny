@@ -22,7 +22,11 @@ if [[ -n "${VENV_PATH:-}" ]]; then
   source "$VENV_PATH/bin/activate"
 fi
 
+# cu118: Pascal/Volta clusters (P100 sm_60, V100 sm_70)
+# cu126: Ampere/Ada clusters (A100, RTX 30xx/40xx)
+UV_EXTRA="${UV_EXTRA:-cu126}"
 CONFIG="${CONFIG:-configs/crypto/lobtransformer/btcusdt_lob.json}"
+uv sync --extra "$UV_EXTRA"
 uv run python -m crypto.lobtransformer.train "$CONFIG"
 
 echo "done: $(date)"
