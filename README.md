@@ -5,7 +5,7 @@ Penny explores three approaches for **price-direction forecasting on cryptocurre
 | Approach | Package | Task | Output |
 |---|---|---|---|
 | **Painting** | `src/painting/` | Inpaint the future LOB image with a diffusion UNet; reconstruct mid-price; classify direction | Softmax probs `{down, stat, up}` via sampled futures |
-| **CSDI** | `src/csdi/` | Two-axis transformer over the full multivariate LOB past window → direct 3-class logits | Softmax probs `{down, stat, up}` |
+| **CSDI** | `src/csdi/` | Convolutional U-Net over the full multivariate LOB past window → direct 3-class logits | Softmax probs `{down, stat, up}` |
 | **TimesFM** | `src/timesfm/` | Transformer over past mid-price returns (+ optional net OFI) → direct 3-class logits | Softmax probs `{down, stat, up}` |
 
 Trained on 10-second order-book snapshots of **BTC/IRT from Nobitex** (Iranian crypto exchange).
@@ -277,32 +277,45 @@ The timestep weight `w(t)` suppresses the trend gradient when t is large (high n
 
 ---
 
-### CSDI — Multivariate Transformer Classifier
+### CSDI — Convolutional U-Net Classifier
 
-**What it does:** takes the full multivariate LOB past window and classifies direction directly — no price forecasting, no diffusion.
+**What it does:** treats the multivariate past window as a 2-channel image (feature rows on the height axis, time on the width axis) and classifies direction with a 2D convolutional U-Net — no price forecasting, no diffusion, no attention.
 
-**Input:** `(B, 2R, T_past)` — all 2·R = 46 feature rows (2 channels × 23 rows) over the T_past past snapshots, z-score normalised.
+**Input:** `(B, 2, R, T_past)` — 2 channels × R = 23 feature rows × T_past time steps, z-score normalised.
 
 **Output:** `(B, 3)` class logits.
 
-**Architecture:** a stack of `csdi_layers` `TwoAxisBlock`s, each applying:
-1. **Time-axis multi-head attention** — across the T_past time dimension for each feature row
-2. **Feature-axis multi-head attention** — across the 2R feature rows at each time step
-3. Group norm + residual (scaled by 1/√2)
+**Architecture:** a standard U-Net contracting/expanding path:
+1. **Stem** — `DoubleConv` (two 3×3 conv → BatchNorm → GELU) maps 2 → `csdi_channels`.
+2. **Contracting path** — `csdi_depth` `Down` blocks, each `MaxPool2d(2)` then `DoubleConv`, doubling channels and halving both spatial dims.
+3. **Expanding path** — `csdi_depth` `Up` blocks, each nearest-neighbour upsample to the matching skip size, 1×1 channel reduction, concatenate the skip connection, then `DoubleConv`.
+4. **Head** — global average pool of the full-resolution feature map → `Linear → GELU → Linear` → `(B, 3)` logits.
 
-After the final block, the tensor is mean-pooled over both the feature and time dimensions to a `(B, C)` vector, then passed through a 2-layer MLP head to produce `(B, 3)` logits.
+With the defaults (`csdi_channels = 64`, `csdi_depth = 3`) the row axis contracts 23 → 11 → 5 → 2 and the time axis 156 → 78 → 39 → 19 at the bottleneck.
 
 ```mermaid
 flowchart LR
-    inp["Past window\n(B, 2R, T_past)\nnormalised"]
-    proj["Conv1d projection\n→ (B, C, 2R, T_past)"]
-    pe["+ time PE\n+ feature embedding"]
-    b1["TwoAxisBlock 1\ntime-attn → feature-attn → norm"]
-    bn["TwoAxisBlock N"]
-    pool["Global mean pool\n→ (B, C)"]
+    inp["Past window\n(B, 2, R, T_past)\nnormalised"]
+    stem["Stem DoubleConv\n→ (B, C, R, T)"]
+
+    subgraph enc["Contracting path"]
+        d1["Down 1\npool + DoubleConv\n→ 2C"]
+        d2["Down 2\n→ 4C"]
+        d3["Down 3 (bottleneck)\n→ 8C"]
+    end
+    subgraph dec["Expanding path  (+ skips)"]
+        u3["Up 3\nupsample + cat skip"]
+        u2["Up 2"]
+        u1["Up 1\n→ C, full res"]
+    end
+
+    pool["Global avg pool\n→ (B, C)"]
     head["MLP head\nLinear → GELU → Linear\n→ (B, 3) logits"]
 
-    inp --> proj --> pe --> b1 --> bn --> pool --> head
+    inp --> stem --> d1 --> d2 --> d3 --> u3 --> u2 --> u1 --> pool --> head
+    stem -. skip .-> u1
+    d1 -. skip .-> u2
+    d2 -. skip .-> u3
 ```
 
 **Loss:**
@@ -580,9 +593,8 @@ All settings live in JSON files under `configs/<approach>/`. Fields shared acros
 |---|---|---|
 | `norm_window_snapshots` | `8640` | Rows for fitting the RollingNormalizer |
 | `clip_percentile` | `0.95` | Outlier clip quantile |
-| `csdi_channels` | `64` | Internal channel width C |
-| `csdi_layers` | `4` | Number of TwoAxisBlock layers |
-| `csdi_heads` | `8` | Attention heads (time and feature axes) |
+| `csdi_channels` | `64` | Base channel width C (doubles each Down block) |
+| `csdi_depth` | `3` | Number of U-Net down/up stages |
 
 **TimesFM-specific:**
 
@@ -633,7 +645,7 @@ src/
     labels.py            Same DeepLOB labels
     features.py          Same multivariate row-stream builder + RollingNormalizer
     dataset.py           CSDIDataset: {past: (2, R, T_past), label: int}
-    model.py             CSDIClassifier: two-axis transformer → (B, 3) logits
+    model.py             CSDIClassifier: 2D conv U-Net → (B, 3) logits
     train.py             Entry point: python -m csdi.train <config>
     evaluate.py          Test metrics: accuracy, F1, confusion, mean probs
     infer.py             Single-pass inference → {label, label_name, probs}

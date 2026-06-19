@@ -1,5 +1,10 @@
-"""CSDI classifier: two-axis (feature + time) transformer that directly predicts
-price direction (down / stationary / up) from the multivariate past window.
+"""CSDI classifier: a 2D convolutional U-Net over the multivariate past window
+that directly predicts price direction (down / stationary / up).
+
+The past window is treated as a 2-channel image with the LOB feature rows on the
+height axis and time on the width axis.  A U-Net contracting/expanding path with
+skip connections extracts spatial features; the final full-resolution feature map
+is globally pooled and mapped to 3 class logits.
 
 Input : ``(B, 2, R, T_past)`` normalised LOB feature tensor.
 Output: ``(B, 3)`` class logits.
@@ -8,97 +13,92 @@ Loss  : CrossEntropy(logits, label).
 
 from __future__ import annotations
 
-import numpy as np
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 
-def _transformer(channels, heads, ff):
-    layer = nn.TransformerEncoderLayer(
-        d_model=channels,
-        nhead=heads,
-        dim_feedforward=ff,
-        activation="gelu",
-        batch_first=False,
-    )
-    return nn.TransformerEncoder(layer, num_layers=1)
+class DoubleConv(nn.Module):
+    """Two 3x3 convolutions, each followed by BatchNorm + GELU (U-Net block)."""
 
-
-class TwoAxisBlock(nn.Module):
-    """One residual block: transformer over time, then over features."""
-
-    def __init__(self, channels, heads):
+    def __init__(self, in_ch: int, out_ch: int) -> None:
         super().__init__()
-        self.time_layer = _transformer(channels, heads, channels * 2)
-        self.feature_layer = _transformer(channels, heads, channels * 2)
-        self.norm = nn.GroupNorm(1, channels)
+        self.net = nn.Sequential(
+            nn.Conv2d(in_ch, out_ch, 3, padding=1),
+            nn.BatchNorm2d(out_ch),
+            nn.GELU(),
+            nn.Conv2d(out_ch, out_ch, 3, padding=1),
+            nn.BatchNorm2d(out_ch),
+            nn.GELU(),
+        )
 
-    def _time(self, y, k, length):
-        b, c, _ = y.shape
-        y = y.reshape(b, c, k, length).permute(0, 2, 1, 3).reshape(b * k, c, length)
-        y = self.time_layer(y.permute(2, 0, 1)).permute(1, 2, 0)
-        return y.reshape(b, k, c, length).permute(0, 2, 1, 3).reshape(b, c, k * length)
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.net(x)
 
-    def _feature(self, y, k, length):
-        b, c, _ = y.shape
-        y = y.reshape(b, c, k, length).permute(0, 3, 1, 2).reshape(b * length, c, k)
-        y = self.feature_layer(y.permute(2, 0, 1)).permute(1, 2, 0)
-        return y.reshape(b, length, c, k).permute(0, 2, 3, 1).reshape(b, c, k * length)
 
-    def forward(self, x, k, length):
-        b, c, _, _ = x.shape
-        y = x.reshape(b, c, k * length)
-        y = self._time(y, k, length)
-        y = self._feature(y, k, length)
-        y = self.norm(y)
-        out = (x.reshape(b, c, k * length) + y) / np.sqrt(2.0)
-        return out.reshape(b, c, k, length)
+class Down(nn.Module):
+    """Downscale by 2 (max-pool) then a double convolution."""
+
+    def __init__(self, in_ch: int, out_ch: int) -> None:
+        super().__init__()
+        self.pool = nn.MaxPool2d(2)
+        self.conv = DoubleConv(in_ch, out_ch)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.conv(self.pool(x))
+
+
+class Up(nn.Module):
+    """Upscale to the skip-connection size, concatenate, then a double conv."""
+
+    def __init__(self, in_ch: int, skip_ch: int, out_ch: int) -> None:
+        super().__init__()
+        self.reduce = nn.Conv2d(in_ch, out_ch, 1)
+        self.conv = DoubleConv(out_ch + skip_ch, out_ch)
+
+    def forward(self, x: torch.Tensor, skip: torch.Tensor) -> torch.Tensor:
+        x = F.interpolate(x, size=skip.shape[-2:], mode="nearest")
+        x = self.reduce(x)
+        x = torch.cat([x, skip], dim=1)
+        return self.conv(x)
 
 
 class CSDIClassifier(nn.Module):
-    """Multivariate two-axis transformer → 3-class direction logits."""
+    """2D conv U-Net over the multivariate past window → 3-class direction logits."""
 
     family = "classifier"
 
     def __init__(self, config: dict) -> None:
         super().__init__()
         self.config = config
-        self.r = 2 * config["n_levels"] + config["n_trade_rows"]
-        self.k = 2 * self.r
-        self.t_past = config["T_past"]
-        c = config.get("csdi_channels", 64)
-        heads = config.get("csdi_heads", 8)
-        layers = config.get("csdi_layers", 4)
-        self.input_projection = nn.Conv1d(1, c, 1)
-        self.feature_embedding = nn.Embedding(self.k, c)
-        self.blocks = nn.ModuleList(TwoAxisBlock(c, heads) for _ in range(layers))
-        self.head = nn.Sequential(nn.Linear(c, c), nn.GELU(), nn.Linear(c, 3))
-        self.channels = c
+        base = config.get("csdi_channels", 64)
+        depth = config.get("csdi_depth", 3)
 
-    def _time_pe(self, length, c, device):
-        pos = torch.arange(length, device=device).unsqueeze(1).float()
-        div = torch.exp(
-            torch.arange(0, c, 2, device=device).float() * -(np.log(10000.0) / c)
+        chans = [base * (2**i) for i in range(depth + 1)]  # encoder widths
+        self.stem = DoubleConv(2, base)
+        self.downs = nn.ModuleList(
+            Down(chans[i], chans[i + 1]) for i in range(depth)
         )
-        pe = torch.zeros(length, c, device=device)
-        pe[:, 0::2] = torch.sin(pos * div)
-        pe[:, 1::2] = torch.cos(pos * div)
-        return pe
+        self.ups = nn.ModuleList(
+            Up(chans[i + 1], chans[i], chans[i]) for i in reversed(range(depth))
+        )
+        self.head = nn.Sequential(
+            nn.AdaptiveAvgPool2d(1),
+            nn.Flatten(),
+            nn.Linear(base, base),
+            nn.GELU(),
+            nn.Linear(base, 3),
+        )
 
     def forward(self, past: torch.Tensor) -> torch.Tensor:
-        b = past.shape[0]
-        length = self.t_past
-        value = past.reshape(b, self.k, length)
-        x = self.input_projection(value.reshape(b, 1, self.k * length))
-        x = x.reshape(b, self.channels, self.k, length)
-        pe = self._time_pe(length, self.channels, past.device)
-        x = x + pe.permute(1, 0).reshape(1, self.channels, 1, length)
-        f_emb = self.feature_embedding(torch.arange(self.k, device=past.device))
-        x = x + f_emb.permute(1, 0).reshape(1, self.channels, self.k, 1)
-        for block in self.blocks:
-            x = block(x, self.k, length)
-        pooled = x.mean(dim=(2, 3))  # (B, C)
-        return self.head(pooled)  # (B, 3) logits
+        x = self.stem(past)  # (B, base, R, T_past)
+        skips = [x]
+        for down in self.downs:
+            x = down(x)
+            skips.append(x)
+        for up, skip in zip(self.ups, reversed(skips[:-1])):
+            x = up(x, skip)
+        return self.head(x)  # (B, 3) logits
 
     def predict(self, batch, device) -> torch.Tensor:
         """Return class logits ``(B, 3)``."""
