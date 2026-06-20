@@ -22,9 +22,24 @@ if [[ -n "${VENV_PATH:-}" ]]; then
   source "$VENV_PATH/bin/activate"
 fi
 
-# cu118: Pascal/Volta clusters (P100 sm_60, V100 sm_70)
-# cu126: Ampere/Ada clusters (A100, RTX 30xx/40xx)
-UV_EXTRA="${UV_EXTRA:-cu126}"
+# Auto-detect PyTorch CUDA extra from GPU compute capability.
+# Override at submit time: UV_EXTRA=cu118 sbatch slurm/jointdiff_ofi.slurm
+if [[ -z "${UV_EXTRA:-}" ]]; then
+    if ! command -v nvidia-smi &>/dev/null; then
+        UV_EXTRA="cpu"
+    else
+        CC=$(nvidia-smi --query-gpu=compute_cap --format=csv,noheader,nounits 2>/dev/null \
+             | head -1 | tr -d '. ')
+        if   [[ -z "$CC" ]];       then UV_EXTRA="cpu"
+        elif [[ "$CC" -lt 75 ]];   then UV_EXTRA="cu118"   # Pascal sm_60-62, Volta sm_70-72
+        elif [[ "$CC" -lt 100 ]];  then UV_EXTRA="cu126"   # Turing sm_75, Ampere sm_80-87, Ada sm_89, Hopper sm_90
+        else                            UV_EXTRA="cu130"   # Blackwell sm_100+
+        fi
+    fi
+    echo "GPU compute cap: ${CC:-none}  →  auto UV_EXTRA=$UV_EXTRA"
+else
+    echo "UV_EXTRA=$UV_EXTRA (user override)"
+fi
 CONFIG="${CONFIG:-configs/crypto/jointdiff/btcusdt_ofi.json}"
 uv sync --extra "$UV_EXTRA"
 uv run python -m crypto.jointdiff.train "$CONFIG"
