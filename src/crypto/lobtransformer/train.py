@@ -67,7 +67,7 @@ def main() -> None:
     args = parser.parse_args()
     config_path = Path(args.config)
     if not config_path.exists():
-        print(f"error: config not found: {config_path}", file=sys.stderr)
+        logger.error("config not found: {}", config_path)
         sys.exit(1)
     config = json.loads(config_path.read_text())
 

@@ -1,33 +1,27 @@
 {
   "symbol": "BTCUSDT",
-  "data_dir": "data/binance",
+  "data_dir": "data/resampled",
   "cache_dir": "data/cache/binance",
   "checkpoint_dir": "checkpoints/binance_jointdiff",
-
   "n_lob_levels": 10,
   "feature_mode": "ofi",
-
   "T_past": 500,
   "label_k": 100,
   "label_alpha": -1,
-
-  "train_frac": 0.70,
+  "train_frac": 0.7,
   "val_frac": 0.15,
   "stride": 1,
-
   "T_max": 1000,
-  "beta_start": 1e-4,
+  "beta_start": 0.0001,
   "beta_end": 0.02,
-
   "jd_base_channels": 32,
   "jd_depth": 2,
   "jd_time_emb": 128,
   "jd_dropout": 0.1,
   "lambda_trend": 1.0,
-
   "batch_size": 64,
-  "lr": 1e-4,
-  "weight_decay": 1e-5,
+  "lr": 0.0001,
+  "weight_decay": 1e-05,
   "warmup_steps": 500,
   "grad_clip": 1.0,
   "epochs": 50,
