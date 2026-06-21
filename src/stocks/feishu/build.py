@@ -4,8 +4,10 @@ Expected directory layout::
 
     data_dir/
       {SYMBOL}/
-        intraday.parquet   # tick LOB: date, time, bid/ask price_{0..9}, bid/ask volume_{0..9}
-        daily.parquet      # daily OHLCV: date, open, high, low, close, volume, vwap_0930_0935
+        intraday.parquet|csv   # tick LOB: date, time, bid/ask price_{0..9}, bid/ask volume_{0..9}
+        daily.parquet|csv      # daily OHLCV: date, open, high, low, close, volume, vwap_0930_0935
+
+Both ``.parquet`` and ``.csv`` are accepted; parquet is tried first.
 
 Public API
 ----------
@@ -37,20 +39,44 @@ from stocks.feishu.features import (
 )
 from stocks.feishu.labels import assign_labels, compute_forward_returns
 
+_EXTS = (".parquet", ".csv")
+
+
+def _read_table(stem: Path, **kwargs) -> pd.DataFrame:
+    """Read a parquet or CSV file given a path stem (without extension)."""
+    for ext in _EXTS:
+        p = stem.with_suffix(ext)
+        if p.exists():
+            return pd.read_parquet(p, **kwargs) if ext == ".parquet" else pd.read_csv(p, **kwargs)
+    raise FileNotFoundError(
+        f"No table found at {stem}.parquet or {stem}.csv"
+    )
+
+
+def _sym_has_data(sym_dir: Path) -> bool:
+    return any(
+        (sym_dir / f"intraday{e}").exists() and (sym_dir / f"daily{e}").exists()
+        for e in _EXTS
+    ) or (
+        any((sym_dir / f"intraday{e}").exists() for e in _EXTS)
+        and any((sym_dir / f"daily{e}").exists() for e in _EXTS)
+    )
+
 
 def discover_symbols(data_dir: str | Path) -> list[str]:
-    """Return sorted list of symbols that have both intraday.parquet and daily.parquet."""
-    root = Path(data_dir)
-    symbols = []
-    for d in sorted(root.iterdir()):
-        if (
-            d.is_dir()
-            and (d / "intraday.parquet").exists()
-            and (d / "daily.parquet").exists()
-        ):
-            symbols.append(d.name)
+    """Return sorted list of symbols that have both intraday and daily files (.parquet or .csv)."""
+    root = Path(data_dir).resolve()
+    if not root.exists():
+        raise FileNotFoundError(f"data_dir does not exist: {root}")
+    symbols = [
+        d.name for d in sorted(root.iterdir()) if d.is_dir() and _sym_has_data(d)
+    ]
     if not symbols:
-        raise FileNotFoundError(f"No symbols found under {root}")
+        raise FileNotFoundError(
+            f"No symbols found under {root}. "
+            f"Expected subdirectories each containing intraday and daily files "
+            f"(.parquet or .csv)."
+        )
     return symbols
 
 
@@ -66,9 +92,9 @@ def compute_date_splits(
         (train_dates, val_dates, test_dates) — each a ``set[str]`` of ``YYYY-MM-DD`` strings.
     """
     all_dates: set[str] = set()
-    root = Path(data_dir)
+    root = Path(data_dir).resolve()
     for sym in symbols:
-        daily = pd.read_parquet(root / sym / "daily.parquet", columns=["date"])
+        daily = _read_table(root / sym / "daily")
         all_dates.update(daily["date"].astype(str).unique())
     sorted_dates = sorted(all_dates)
     n = len(sorted_dates)
@@ -140,7 +166,7 @@ def build_hdf5(
     alpha = config["alpha"]
     n_levels = config.get("n_lob_levels", N_LEVELS)
     nf = n_features(config)
-    root = Path(data_dir)
+    root = Path(data_dir).resolve()
 
     logger.info(
         "Building HDF5 {} split={} mode={} T={} nf={}", path.name, split, mode, T, nf
@@ -153,8 +179,8 @@ def build_hdf5(
     sorted_dates_map: dict[str, list[str]] = {}
 
     for sym in symbols:
-        intra = pd.read_parquet(root / sym / "intraday.parquet")
-        daily = pd.read_parquet(root / sym / "daily.parquet")
+        intra = _read_table(root / sym / "intraday")
+        daily = _read_table(root / sym / "daily")
         daily["date"] = daily["date"].astype(str)
         intra["date"] = intra["date"].astype(str)
         daily = daily.sort_values("date").reset_index(drop=True)
