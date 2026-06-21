@@ -23,8 +23,7 @@ from torch.utils.data import DataLoader
 from crypto.utils.evaluate import run_test
 from crypto.utils.training import build_cosine_schedule, resolve_device
 from models.jointdiff import JointDiffusion, count_parameters
-from stocks.feishu.build import build_hdf5, discover_symbols
-from stocks.feishu.dataset import DiskLOBDataset
+from stocks.feishu.build import build_datasets, discover_symbols
 from stocks.feishu.features import n_features as feishu_n_features
 
 
@@ -124,13 +123,18 @@ def main() -> None:
         device,
     )
 
-    train_h5, val_h5, test_h5 = build_hdf5(config, data_dir, cache_dir, symbols)
-
-    train_ds = DiskLOBDataset(str(train_h5))
-    val_ds = DiskLOBDataset(str(val_h5))
-    test_ds = DiskLOBDataset(str(test_h5))
+    train_ds, val_ds, test_ds, meta = build_datasets(
+        config, data_dir, cache_dir, symbols
+    )
+    cb = meta["class_balance"]
     logger.info(
         "  windows  train={}  val={}  test={}", len(train_ds), len(val_ds), len(test_ds)
+    )
+    logger.info(
+        "  train balance  down={:.1%} stat={:.1%} up={:.1%}",
+        cb["down"],
+        cb["stationary"],
+        cb["up"],
     )
 
     nw = min(4, torch.get_num_threads())

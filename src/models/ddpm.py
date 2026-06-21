@@ -37,9 +37,13 @@ class DDPMScheduler:
         clip_sample: bool = True,
     ) -> None:
         if beta_schedule != "linear":
-            raise ValueError(f"Only 'linear' beta_schedule is supported, got {beta_schedule!r}")
+            raise ValueError(
+                f"Only 'linear' beta_schedule is supported, got {beta_schedule!r}"
+            )
         self.config = _Config(num_train_timesteps)
-        betas = torch.linspace(beta_start, beta_end, num_train_timesteps, dtype=torch.float64)
+        betas = torch.linspace(
+            beta_start, beta_end, num_train_timesteps, dtype=torch.float64
+        )
         alphas = 1.0 - betas
         alpha_bar = torch.cumprod(alphas, dim=0).float()
         self._sqrt_alpha_bar = alpha_bar.sqrt()

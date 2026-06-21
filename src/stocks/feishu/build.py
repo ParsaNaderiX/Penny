@@ -1,4 +1,12 @@
-"""HDF5 cache builder for Feishu A-share equity data.
+"""Memmap cache builder + dataset factory for Feishu A-share equity data.
+
+Memory model (mirrors crypto binance/nobitex)
+---------------------------------------------
+Instead of materialising every T-day window to disk (which duplicates each
+day's features ~T times — tens of GB), this builds a single per-(asset, day)
+feature **memmap** of shape ``(N_rows, NF)`` and slides windows lazily at
+training time (see :class:`~stocks.feishu.dataset.LOBDataset`).  RAM scales
+with ``batch_size × T × NF``; disk scales with ``N_rows × NF``.
 
 Expected data_dir contents (two flat multi-asset parquet files)::
 
@@ -16,22 +24,21 @@ Daily file columns: asset_id, trade_day_id, open, high, low, close,
 
 Label (causal pairing)
 ----------------------
-Window of T days ending at day t is paired with the label at day t+1:
+A window of T days ending at day t is paired with the row label at day t+1:
   label_{t+1} = (close_{t+2} - vwap_{t+1}) / vwap_{t+1}
 By end-of-day t the trader knows all features through day t but NOT the
-morning vwap of day t+1 (the trade entry price), so there is zero leakage.
+morning vwap of day t+1 (the entry price), so there is zero leakage.
 
 Split
 -----
-Per-asset chronological split of windows:
-  train : first 70 %
-  val   : next  15 %  (cumulative 70–85 %)
-  test  : last  15 %  (cumulative 85–100 %)
+Per-asset chronological split of that asset's windows:
+  train : first 70 %   val : next 15 %   test : last 15 %
 
 Public API
 ----------
 - discover_symbols(data_dir, config) → sorted list of symbol names (asset_id)
-- build_hdf5(config, data_dir, cache_dir, symbols) → (train_path, val_path, test_path)
+- build_datasets(config, data_dir, cache_dir, symbols)
+      → (train_ds, val_ds, test_ds, meta)
 """
 
 from __future__ import annotations
@@ -44,11 +51,12 @@ import numpy as np
 import pandas as pd
 from loguru import logger
 
-from stocks.feishu.dataset import WindowWriter
+from stocks.feishu.dataset import LOBDataset
 from stocks.feishu.features import (
     CLIP_VAL,
     N_LEVELS,
     N_OFI,
+    N_OHLCV,
     causal_rolling_zscore,
     compute_ofi_tick,
     compute_ohlcv_features,
@@ -100,6 +108,9 @@ def discover_symbols(data_dir: str | Path, config: dict | None = None) -> list[s
     return symbols
 
 
+# ── cache paths ──────────────────────────────────────────────────────────────
+
+
 def _cache_key(config: dict) -> str:
     sig = {
         k: config[k]
@@ -109,39 +120,52 @@ def _cache_key(config: dict) -> str:
     return hashlib.sha1(json.dumps(sig, sort_keys=True).encode()).hexdigest()[:8]
 
 
-def build_hdf5(
+def _cache_paths(cache_dir: Path, key: str) -> dict[str, Path]:
+    prefix = cache_dir / f"feishu_{key}"
+    return {
+        "feat": prefix.with_suffix(".feat.npy"),
+        "label": prefix.with_suffix(".label.npy"),
+        "asset": prefix.with_suffix(".asset.npy"),
+        "meta": prefix.with_suffix(".meta.json"),
+    }
+
+
+# ── cache build ──────────────────────────────────────────────────────────────
+
+
+def _build_cache(
     config: dict,
     data_dir: str | Path,
     cache_dir: str | Path,
     symbols: list[str],
-) -> tuple[Path, Path, Path]:
-    """Build (or return cached) train/val/test HDF5 files.
-
-    Pipeline
-    --------
-    1. Load flat LOB and daily parquet files once.
-    2. Per-symbol: compute LOB/OFI features, apply causal rolling z-score.
-    3. Cross-sectional z-score of OHLCV across all assets per day.
-    4. Per-symbol: slide T-past windows with causal label, split 70/15/15,
-       clip to ±5, write to HDF5.
+) -> tuple[np.memmap, np.ndarray, np.ndarray, int]:
+    """Build (or load) the per-(asset, day) feature memmap and row arrays.
 
     Returns:
-        (train_path, val_path, test_path)
+        ``(feat, row_labels, row_asset, NF)`` where
+          feat        : ``(N_rows, NF)`` float32 memmap (read-only).
+          row_labels  : ``(N_rows,)`` int64 causal labels (-1 = invalid).
+          row_asset   : ``(N_rows,)`` int64 asset index per row (contiguous).
+          NF          : feature count.
     """
-    out_dir = Path(cache_dir)
-    out_dir.mkdir(parents=True, exist_ok=True)
+    cache_dir = Path(cache_dir)
+    cache_dir.mkdir(parents=True, exist_ok=True)
     key = _cache_key(config)
-    paths = {s: out_dir / f"{s}_{key}.h5" for s in ("train", "val", "test")}
+    paths = _cache_paths(cache_dir, key)
+    nf = n_features(config)
 
     if all(p.exists() for p in paths.values()):
-        logger.info("Cache hit: {}", out_dir / f"*_{key}.h5")
-        return paths["train"], paths["val"], paths["test"]
+        meta = json.loads(paths["meta"].read_text())
+        n_rows = meta["n_rows"]
+        feat = np.memmap(paths["feat"], dtype=np.float32, mode="r", shape=(n_rows, nf))
+        row_labels = np.load(paths["label"])
+        row_asset = np.load(paths["asset"])
+        logger.info("loaded feishu cache key={}: {:,} rows × {} feat", key, n_rows, nf)
+        return feat, row_labels, row_asset, nf
 
     mode = config.get("feature_mode", "ofi")
-    T = config["T_past"]
     alpha = config["alpha"]
     n_levels = config.get("n_lob_levels", N_LEVELS)
-    nf = n_features(config)
     n_lob_feat = N_OFI if mode == "ofi" else 4 * n_levels
     root = Path(data_dir).resolve()
     sym_col = config.get("symbol_col", _SYM_COL)
@@ -150,164 +174,202 @@ def build_hdf5(
     lob_file = config.get("lob_file", _LOB_FILE)
     daily_file = config.get("daily_file", _DAILY_FILE)
 
-    logger.info("Building HDF5 cache key={} mode={} T={} nf={}", key, mode, T, nf)
+    logger.info("building feishu cache key={} mode={} nf={}", key, mode, nf)
 
-    # ── Load flat files; rename columns to match features/labels expectations ─
-    lob_all = pd.read_parquet(root / lob_file)
-    lob_all = _lob_rename(lob_all)
-    lob_all = lob_all.rename(columns={day_col: "date"})
+    # ── Pass 1 (daily, small): per-asset OHLCV raw feats, labels, day order ──
+    daily_all = pd.read_parquet(root / daily_file).rename(columns={day_col: "date"})
+    daily_all["date"] = daily_all["date"].astype(str)
 
-    daily_all = pd.read_parquet(root / daily_file)
-    daily_all = daily_all.rename(columns={day_col: "date"})
+    sym_set = set(symbols)
+    daily_all = daily_all[daily_all[sym_col].isin(sym_set)]
 
-    # ── Pass 1: per-asset feature extraction ─────────────────────────────────
-    # lob_feats_map[sym][date]  → (n_lob_feat,) float32  (causal-z-scored)
-    # ohlcv_raw_map[sym][date]  → (19,) float32           (before cs-zscore)
-    # labels_map[sym][date]     → int
-    # dates_map[sym]            → sorted list[str]
-    lob_feats_map: dict[str, dict[str, np.ndarray]] = {}
-    ohlcv_raw_map: dict[str, dict[str, np.ndarray]] = {}
-    labels_map: dict[str, dict[str, int]] = {}
     dates_map: dict[str, list[str]] = {}
+    ohlcv_raw_map: dict[str, np.ndarray] = {}  # sym → (n_days, 19)
+    labels_map: dict[str, np.ndarray] = {}  # sym → (n_days,) int64
 
-    for sym in symbols:
-        lob_sym = (
-            lob_all[lob_all[sym_col] == sym]
-            .sort_values(["date", time_col])
-            .reset_index(drop=True)
-        )
-        daily_sym = (
-            daily_all[daily_all[sym_col] == sym]
-            .sort_values("date")
-            .reset_index(drop=True)
-        )
-
-        sym_dates = sorted(daily_sym["date"].astype(str).unique())
+    for sym, daily_sym in daily_all.groupby(sym_col, sort=True):
+        daily_sym = daily_sym.sort_values("date").reset_index(drop=True)
+        sym_dates = daily_sym["date"].tolist()
+        if len(sym_dates) == 0:
+            continue
         dates_map[sym] = sym_dates
-
-        # ── LOB / OFI features per day ─────────────────────────────────────
-        lob_rows: list[np.ndarray] = []
-        for d in sym_dates:
-            day_lob = lob_sym[lob_sym["date"].astype(str) == d].reset_index(drop=True)
-            if len(day_lob) == 0:
-                lob_rows.append(np.zeros(n_lob_feat, dtype=np.float32))
-                continue
-            if mode == "ofi":
-                ofi_df = compute_ofi_tick(day_lob)
-                vec = snap_to_slots(ofi_df, day_lob).reshape(-1)  # (240,)
-            else:
-                vec = extract_lob_day(day_lob, n_levels)  # (4n,)
-            lob_rows.append(vec)
-
-        lob_mat = np.stack(lob_rows, axis=0)  # (n_days, n_lob_feat)
-        lob_norm = causal_rolling_zscore(lob_mat)
-        lob_feats_map[sym] = {d: lob_norm[i] for i, d in enumerate(sym_dates)}
-
-        # ── OHLCV features per day (store raw; cs-zscore in pass 2) ────────
         try:
             ohlcv_df = compute_ohlcv_features(daily_sym)
-            for i, d in enumerate(sym_dates):
-                ohlcv_raw_map.setdefault(sym, {})[d] = ohlcv_df.iloc[i].values.astype(
-                    np.float32
-                )
+            ohlcv_raw_map[sym] = ohlcv_df.values.astype(np.float32)  # (n_days, 19)
         except Exception as exc:
             logger.warning("OHLCV failed for {}: {}", sym, exc)
-
-        # ── Labels ─────────────────────────────────────────────────────────
+            ohlcv_raw_map[sym] = np.zeros((len(sym_dates), N_OHLCV), dtype=np.float32)
         fwd = compute_forward_returns(daily_sym)
-        lbl = assign_labels(fwd, alpha)
-        labels_map[sym] = {d: int(lbl[i]) for i, d in enumerate(sym_dates)}
+        labels_map[sym] = assign_labels(fwd, alpha)
+    del daily_all
 
-    # ── Pass 2: cross-sectional z-score of OHLCV per day ─────────────────────
-    all_dates = sorted({d for sym in symbols for d in dates_map[sym]})
-    ohlcv_cs: dict[str, dict[str, np.ndarray]] = {sym: {} for sym in symbols}
+    # ── Row layout: assets in sorted order, days in date order ──────────────
+    ordered_syms = [s for s in symbols if s in dates_map]
+    ranges: dict[str, tuple[int, int]] = {}
+    ptr = 0
+    for i, sym in enumerate(ordered_syms):
+        n_days = len(dates_map[sym])
+        ranges[sym] = (ptr, ptr + n_days)
+        ptr += n_days
+    n_rows = ptr
+    if n_rows == 0:
+        raise ValueError("No (asset, day) rows to build — check data files.")
 
-    for d in all_dates:
-        vecs, syms_on_day = [], []
-        for sym in symbols:
-            if sym in ohlcv_raw_map and d in ohlcv_raw_map[sym]:
-                vecs.append(ohlcv_raw_map[sym][d])
-                syms_on_day.append(sym)
-        if not vecs:
+    sym_to_idx = {s: i for i, s in enumerate(ordered_syms)}
+    feat = np.memmap(paths["feat"], dtype=np.float32, mode="w+", shape=(n_rows, nf))
+    row_labels = np.full(n_rows, -1, dtype=np.int64)
+    row_asset = np.empty(n_rows, dtype=np.int64)
+    ohlcv_block = np.zeros((n_rows, N_OHLCV), dtype=np.float32)
+
+    for sym in ordered_syms:
+        lo, hi = ranges[sym]
+        row_asset[lo:hi] = sym_to_idx[sym]
+        row_labels[lo:hi] = labels_map[sym]
+        ohlcv_block[lo:hi] = ohlcv_raw_map[sym]
+
+    # ── Pass 2 (LOB, large): per-asset OFI/LOB features → feat[:, :n_lob] ────
+    lob_cols = [sym_col, day_col, time_col]
+    for i in range(N_LEVELS):
+        j = i + 1
+        lob_cols += [
+            f"bid_price_{j}",
+            f"ask_price_{j}",
+            f"bid_volume_{j}",
+            f"ask_volume_{j}",
+        ]
+    lob_all = pd.read_parquet(root / lob_file, columns=lob_cols)
+    lob_all = _lob_rename(lob_all).rename(columns={day_col: "date"})
+    lob_all["date"] = lob_all["date"].astype(str)
+    lob_all = lob_all[lob_all[sym_col].isin(set(ordered_syms))]
+
+    for sym, lob_sym in lob_all.groupby(sym_col, sort=False):
+        if sym not in ranges:
             continue
-        mat = np.stack(vecs, axis=0).astype(np.float64)
+        lo, hi = ranges[sym]
+        sym_dates = dates_map[sym]
+        date_to_local = {d: k for k, d in enumerate(sym_dates)}
+        lob_sym = lob_sym.sort_values(["date", time_col])
+
+        block = np.zeros((len(sym_dates), n_lob_feat), dtype=np.float32)
+        for d, day_lob in lob_sym.groupby("date", sort=False):
+            k = date_to_local.get(d)
+            if k is None or len(day_lob) == 0:
+                continue
+            day_lob = day_lob.reset_index(drop=True)
+            if mode == "ofi":
+                ofi_df = compute_ofi_tick(day_lob)
+                block[k] = snap_to_slots(ofi_df, day_lob).reshape(-1)  # (240,)
+            else:
+                block[k] = extract_lob_day(day_lob, n_levels)  # (4n,)
+
+        block = causal_rolling_zscore(block)
+        feat[lo:hi, :n_lob_feat] = np.clip(block, -CLIP_VAL, CLIP_VAL)
+    del lob_all
+
+    # ── Pass 3: cross-sectional z-score of OHLCV per day → feat[:, n_lob:] ───
+    # Group global rows by their calendar day across all assets.
+    day_to_rows: dict[str, list[int]] = {}
+    for sym in ordered_syms:
+        lo, _ = ranges[sym]
+        for k, d in enumerate(dates_map[sym]):
+            day_to_rows.setdefault(d, []).append(lo + k)
+
+    for d, rows in day_to_rows.items():
+        idx = np.asarray(rows, dtype=np.int64)
+        mat = ohlcv_block[idx].astype(np.float64)
         mu = mat.mean(axis=0)
         sigma = mat.std(axis=0)
         sigma[sigma < 1e-8] = 1.0
         normed = ((mat - mu) / sigma).astype(np.float32)
-        for i, sym in enumerate(syms_on_day):
-            ohlcv_cs[sym][d] = normed[i]
+        feat[idx, n_lob_feat:] = np.clip(normed, -CLIP_VAL, CLIP_VAL)
 
-    # ── Pass 3: per-asset window slide → per-asset 70/15/15 split → HDF5 ─────
-    writers = {
-        s: WindowWriter(str(paths[s]), T=T, NF=nf) for s in ("train", "val", "test")
-    }
-    totals = {s: 0 for s in ("train", "val", "test")}
+    feat.flush()
+    del feat, ohlcv_block
 
-    for asset_idx, sym in enumerate(symbols):
-        sym_dates = dates_map[sym]
-        n_days = len(sym_dates)
-
-        # need at least T+1 days (window of T + one label day)
-        if n_days < T + 1:
-            continue
-
-        # Build all valid windows for this asset (causal pairing)
-        # window_dates = sym_dates[i:i+T], label = labels_map[sym][sym_dates[i+T]]
-        X_wins: list[np.ndarray] = []
-        y_wins: list[int] = []
-
-        for i in range(n_days - T):
-            label_date = sym_dates[i + T]
-            lbl_val = labels_map[sym].get(label_date, -1)
-            if lbl_val == -1:
-                continue
-
-            window_dates = sym_dates[i : i + T]
-            rows = []
-            ok = True
-            for d in window_dates:
-                lob_v = lob_feats_map[sym].get(d)
-                ohlcv_v = ohlcv_cs[sym].get(d)
-                if lob_v is None or ohlcv_v is None:
-                    ok = False
-                    break
-                feat = np.concatenate([lob_v, ohlcv_v]).astype(np.float32)
-                rows.append(feat)
-            if not ok:
-                continue
-
-            x = np.stack(rows, axis=0)  # (T, nf)
-            x = np.clip(x, -CLIP_VAL, CLIP_VAL)
-            X_wins.append(x)
-            y_wins.append(lbl_val)
-
-        if not X_wins:
-            continue
-
-        X = np.stack(X_wins, axis=0)[:, np.newaxis, :, :]  # (N, 1, T, NF)
-        Y = np.array(y_wins, dtype=np.int64)
-        n_total = len(Y)
-        n_train = int(_TRAIN_FRAC * n_total)
-        n_val = int(_VAL_CUM * n_total)
-
-        slices = {
-            "train": slice(0, n_train),
-            "val": slice(n_train, n_val),
-            "test": slice(n_val, None),
-        }
-        for split, sl in slices.items():
-            writers[split].write(X[sl], Y[sl], asset_idx)
-            totals[split] += len(Y[sl])
-
-    for w in writers.values():
-        w.close()
-
-    logger.info(
-        "Built cache key={} | train={} val={} test={}",
-        key,
-        totals["train"],
-        totals["val"],
-        totals["test"],
+    np.save(paths["label"], row_labels)
+    np.save(paths["asset"], row_asset)
+    paths["meta"].write_text(
+        json.dumps(
+            {"n_rows": n_rows, "nf": nf, "n_assets": len(ordered_syms)}, indent=2
+        )
     )
-    return paths["train"], paths["val"], paths["test"]
+    logger.info("feishu cache built key={}: {:,} rows × {} feat", key, n_rows, nf)
+
+    feat = np.memmap(paths["feat"], dtype=np.float32, mode="r", shape=(n_rows, nf))
+    return feat, row_labels, row_asset, nf
+
+
+# ── dataset factory ──────────────────────────────────────────────────────────
+
+
+def _asset_ranges(row_asset: np.ndarray) -> list[tuple[int, int]]:
+    """Return contiguous ``[lo, hi)`` row ranges, one per asset index."""
+    if len(row_asset) == 0:
+        return []
+    boundaries = np.flatnonzero(np.diff(row_asset)) + 1
+    edges = [0, *boundaries.tolist(), len(row_asset)]
+    return [(edges[i], edges[i + 1]) for i in range(len(edges) - 1)]
+
+
+def build_datasets(
+    config: dict,
+    data_dir: str | Path,
+    cache_dir: str | Path,
+    symbols: list[str],
+) -> tuple[LOBDataset, LOBDataset, LOBDataset, dict]:
+    """Return ``(train_ds, val_ds, test_ds, meta)`` over the memmap cache.
+
+    Windows are computed per asset (causal label, no straddling), then split
+    70 / 15 / 15 chronologically within each asset.
+    """
+    T = config["T_past"]
+    feat, row_labels, row_asset, nf = _build_cache(config, data_dir, cache_dir, symbols)
+
+    train_starts: list[int] = []
+    val_starts: list[int] = []
+    test_starts: list[int] = []
+
+    for lo, hi in _asset_ranges(row_asset):
+        # valid starts: window [s, s+T) within asset, causal label row_labels[s+T] valid
+        asset_starts = [s for s in range(lo, hi - T) if row_labels[s + T] >= 0]
+        if not asset_starts:
+            continue
+        n = len(asset_starts)
+        n_train = int(_TRAIN_FRAC * n)
+        n_val = int(_VAL_CUM * n)
+        train_starts.extend(asset_starts[:n_train])
+        val_starts.extend(asset_starts[n_train:n_val])
+        test_starts.extend(asset_starts[n_val:])
+
+    train_arr = np.asarray(train_starts, dtype=np.int64)
+    val_arr = np.asarray(val_starts, dtype=np.int64)
+    test_arr = np.asarray(test_starts, dtype=np.int64)
+
+    def _balance(starts: np.ndarray) -> dict:
+        if len(starts) == 0:
+            return {"down": 0.0, "stationary": 0.0, "up": 0.0}
+        lbl = row_labels[starts + T]
+        c = np.bincount(lbl, minlength=3) / len(lbl)
+        return {"down": float(c[0]), "stationary": float(c[1]), "up": float(c[2])}
+
+    meta = {
+        "counts": {
+            "train": len(train_arr),
+            "val": len(val_arr),
+            "test": len(test_arr),
+        },
+        "class_balance": _balance(train_arr),
+        "n_features": nf,
+        "n_rows": len(row_asset),
+    }
+    logger.info(
+        "windows — train:{} val:{} test:{}",
+        meta["counts"]["train"],
+        meta["counts"]["val"],
+        meta["counts"]["test"],
+    )
+
+    train_ds = LOBDataset(feat, train_arr, row_labels, T)
+    val_ds = LOBDataset(feat, val_arr, row_labels, T)
+    test_ds = LOBDataset(feat, test_arr, row_labels, T)
+    return train_ds, val_ds, test_ds, meta
