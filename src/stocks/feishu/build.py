@@ -277,8 +277,8 @@ def _build_cache(
     for d, rows in day_to_rows.items():
         idx = np.asarray(rows, dtype=np.int64)
         mat = ohlcv_block[idx].astype(np.float64)
-        mu = mat.mean(axis=0)
-        sigma = mat.std(axis=0)
+        mu = np.nanmean(mat, axis=0)
+        sigma = np.nanstd(mat, axis=0)
         sigma[sigma < 1e-8] = 1.0
         normed = ((mat - mu) / sigma).astype(np.float32)
         feat[idx, n_lob_feat:] = np.clip(normed, -CLIP_VAL, CLIP_VAL)

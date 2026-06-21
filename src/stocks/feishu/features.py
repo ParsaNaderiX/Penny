@@ -294,4 +294,4 @@ def compute_ohlcv_features(daily_df: pd.DataFrame) -> pd.DataFrame:
         df["vwap_0930_0935"].abs() + 1e-8
     )
 
-    return df[OHLCV_COLS]
+    return df[OHLCV_COLS].fillna(0.0)
