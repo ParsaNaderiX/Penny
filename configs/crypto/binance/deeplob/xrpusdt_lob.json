@@ -1,9 +1,9 @@
 {
   "exchange": "binance",
-  "symbol": "BTCUSDT",
+  "symbol": "XRPUSDT",
   "data_dir": "data/resampled/binance",
-  "cache_dir": "data/cache/binance/BTCUSDT",
-  "checkpoint_dir": "checkpoints/binance/BTCUSDT",
+  "cache_dir": "data/cache/binance/XRPUSDT",
+  "checkpoint_dir": "checkpoints/binance/XRPUSDT",
   "n_lob_levels": 10,
   "feature_mode": "lob",
   "T_past": 60,
