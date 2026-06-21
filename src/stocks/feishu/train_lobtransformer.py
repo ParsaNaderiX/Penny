@@ -22,7 +22,7 @@ from torch.utils.data import DataLoader
 from crypto.utils.evaluate import run_test
 from crypto.utils.training import build_cosine_schedule, resolve_device
 from models.lobtransformer import LOBTransformer, count_parameters
-from stocks.feishu.build import build_hdf5, compute_date_splits, discover_symbols
+from stocks.feishu.build import build_hdf5, discover_symbols
 from stocks.feishu.dataset import DiskLOBDataset
 from stocks.feishu.features import n_features as feishu_n_features
 
@@ -81,10 +81,7 @@ def main() -> None:
 
     data_dir = Path(config["data_dir"])
     cache_dir = Path(config["cache_dir"])
-    symbols = discover_symbols(data_dir)
-    train_dates, val_dates, test_dates = compute_date_splits(
-        data_dir, symbols, config.get("train_frac", 0.7), config.get("val_frac", 0.15)
-    )
+    symbols = discover_symbols(data_dir, config)
     config["n_features"] = feishu_n_features(config)
     config["T_past"] = config.get("T_past", 50)
 
@@ -100,9 +97,7 @@ def main() -> None:
         device,
     )
 
-    train_h5 = build_hdf5(config, "train", train_dates, data_dir, cache_dir, symbols)
-    val_h5 = build_hdf5(config, "val", val_dates, data_dir, cache_dir, symbols)
-    test_h5 = build_hdf5(config, "test", test_dates, data_dir, cache_dir, symbols)
+    train_h5, val_h5, test_h5 = build_hdf5(config, data_dir, cache_dir, symbols)
 
     train_ds = DiskLOBDataset(str(train_h5))
     val_ds = DiskLOBDataset(str(val_h5))

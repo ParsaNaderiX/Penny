@@ -7,9 +7,9 @@ Two modes controlled by ``config["feature_mode"]``:
 
 OFI features (240)
 ------------------
-24 intraday time slots × 10 LOB levels.  Slot OFI is the sum of per-tick
-signed Cont-OFI within each slot.  Normalised with a causal 5-day rolling
-z-score (no lookahead).
+24 intraday time slots × 10 LOB levels.  Slot OFI is placed at the exact
+10-min mark (09:40, 09:50, …); off-grid 5-min bars are zero-filled.
+Normalised with a causal 5-day rolling z-score (no lookahead).
 
 LOB features (4n for n levels)
 -------------------------------
@@ -24,12 +24,12 @@ OHLCV features (19)
 -------------------
 14 engineered daily features + 5 raw (open, close, volume, low, high).
 Cross-sectional z-scored across all assets on the same day (done in
-the train script, not here).
+build.py, not here).
 
 After all normalisations, values are clipped to [-5, 5].
 
-Chinese A-share trading hours (24 slots)
------------------------------------------
+Chinese A-share trading hours (24 slots, 10-min grid)
+------------------------------------------------------
   Morning:    9:40–11:20  (11 slots every 10 min)
   Afternoon: 13:00–15:00  (13 slots every 10 min)
 """
@@ -40,6 +40,7 @@ import numpy as np
 import pandas as pd
 
 SLOTS: list[str] = [
+    # Morning session 09:40–11:20 (11 slots, 10-min)
     "09:40",
     "09:50",
     "10:00",
@@ -51,6 +52,7 @@ SLOTS: list[str] = [
     "11:00",
     "11:10",
     "11:20",
+    # Afternoon session 13:00–15:00 (13 slots, 10-min)
     "13:00",
     "13:10",
     "13:20",
@@ -68,6 +70,9 @@ SLOTS: list[str] = [
 N_SLOTS: int = len(SLOTS)  # 24
 N_LEVELS: int = 10
 N_OFI: int = N_SLOTS * N_LEVELS  # 240
+
+# Precomputed for O(1) lookup in snap_to_slots
+_SLOT_TO_IDX: dict[str, int] = {s: i for i, s in enumerate(SLOTS)}
 N_OFI_ROLL: int = 5
 
 OHLCV_COLS: list[str] = [
@@ -146,24 +151,32 @@ def compute_ofi_tick(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def snap_to_slots(ofi_df: pd.DataFrame, day_df: pd.DataFrame) -> np.ndarray:
-    """Aggregate per-tick OFI into 24 intraday slots.
+    """Place per-tick OFI into the 24 intraday 10-min slot grid.
+
+    Only ticks whose ``time`` exactly matches a slot string (``HH:MM`` or
+    ``HH:MM:SS``) are placed; off-grid ticks (e.g. the 5-min bars between
+    10-min marks) contribute zero.  When multiple ticks share a slot the last
+    one wins (consistent with the reference notebook behaviour).
 
     Args:
         ofi_df:  Per-tick OFI DataFrame (output of :func:`compute_ofi_tick`).
-        day_df:  Companion rows with a ``time`` column (``HH:MM`` prefix).
+        day_df:  Companion rows with a ``time`` column.
 
     Returns:
-        ``(N_SLOTS, N_LEVELS)`` float32 array; missing slots are zero.
+        ``(N_SLOTS, N_LEVELS)`` float32 array; un-matched slots are zero.
     """
-    combined = ofi_df.copy()
-    combined["slot"] = day_df["time"].astype(str).str[:5]
-
     ofi_cols = [f"ofi_{i}" for i in range(N_LEVELS)]
+    ofi_arr = ofi_df[ofi_cols].values.astype(np.float32)
+
+    # Accept both "HH:MM" and "HH:MM:SS" by stripping to first 5 chars for lookup
+    times = day_df["time"].astype(str).str[:5]
+    slot_idx = times.map(_SLOT_TO_IDX).to_numpy()
+
     out = np.zeros((N_SLOTS, N_LEVELS), dtype=np.float32)
-    for j, slot in enumerate(SLOTS):
-        mask = combined["slot"] == slot
-        if mask.any():
-            out[j] = combined.loc[mask, ofi_cols].sum().values.astype(np.float32)
+    keep = ~pd.isna(slot_idx)
+    if keep.any():
+        valid_idx = slot_idx[keep].astype(np.int64)
+        out[valid_idx] = ofi_arr[keep]  # last one wins for any duplicate
     return out
 
 
