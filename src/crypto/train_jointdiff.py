@@ -19,7 +19,7 @@ from pathlib import Path
 
 import torch
 import torch.nn.functional as F
-from diffusers import DDPMScheduler
+from models.ddpm import DDPMScheduler
 from loguru import logger
 from torch.optim import AdamW
 from torch.utils.data import DataLoader
