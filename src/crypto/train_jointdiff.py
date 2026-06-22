@@ -28,9 +28,9 @@ from loguru import logger
 from torch.optim import AdamW
 from torch.utils.data import DataLoader
 
-from crypto.utils.dataset import build_datasets
-from crypto.utils.evaluate import run_test
-from crypto.utils.training import build_cosine_schedule, resolve_device
+from crypto.dataset import build_datasets
+from utils.evaluate import run_test
+from utils.training import build_cosine_schedule, resolve_device
 from models.jointdiff import JointDiffusion, count_parameters
 
 

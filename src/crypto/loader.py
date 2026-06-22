@@ -13,7 +13,7 @@ Subsequent calls return the cached memmap immediately.
 
 Usage
 -----
-    from crypto.utils.loader import build_cache
+    from crypto.loader import build_cache
     feat, mid, ts = build_cache(config, extract_features_fn, n_features_fn, tag)
     # feat : np.memmap (N, F) float32  — pre-normalized
     # mid  : np.ndarray (N,) float64

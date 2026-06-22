@@ -23,8 +23,8 @@ from loguru import logger
 from torch.optim import AdamW
 from torch.utils.data import DataLoader
 
-from crypto.utils.evaluate import run_test
-from crypto.utils.training import build_cosine_schedule, resolve_device
+from utils.evaluate import run_test
+from utils.training import build_cosine_schedule, resolve_device
 from models.lobtransformer import LOBTransformer, count_parameters
 from stocks.feishu.build import build_datasets, discover_symbols
 from stocks.feishu.features import n_features as feishu_n_features
