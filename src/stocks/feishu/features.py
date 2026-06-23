@@ -2,21 +2,14 @@
 
 Two modes controlled by ``config["feature_mode"]``:
 
-  ``"ofi"`` — 24-slot intraday OFI (480) + 19 OHLCV  = 499 features
+  ``"ofi"`` — 24-slot intraday OFI (240) + 19 OHLCV  = 259 features
   ``"lob"`` — closing-snapshot price/vol (4n) + 19 OHLCV = 4n+19 features
 
-OFI features (480)
+OFI features (240)
 ------------------
-24 intraday time slots × 10 LOB levels × 2 (bid OFI + ask OFI).
-Matches the crypto feature convention: bid and ask OFI are stored
-separately with a signed-log transform applied to each, rather than
-combined as a net value.  Slot OFI is placed at the exact 10-min mark
-(09:40, 09:50, …); off-grid 5-min bars are zero-filled.
+24 intraday time slots × 10 LOB levels.  Slot OFI is placed at the exact
+10-min mark (09:40, 09:50, …); off-grid 5-min bars are zero-filled.
 Normalised with a causal 5-day rolling z-score (no lookahead).
-
-Feature layout per slot (20 values):
-  [0 : N_LEVELS)   signed-log bid OFI for levels 0–9
-  [N_LEVELS : 2*N_LEVELS) signed-log ask OFI for levels 0–9
 
 LOB features (4n for n levels)
 -------------------------------
@@ -76,7 +69,7 @@ SLOTS: list[str] = [
 ]
 N_SLOTS: int = len(SLOTS)  # 24
 N_LEVELS: int = 10
-N_OFI: int = N_SLOTS * N_LEVELS * 2  # 480  (bid + ask OFI, matching crypto)
+N_OFI: int = N_SLOTS * N_LEVELS  # 240
 
 # Precomputed for O(1) lookup in snap_to_slots
 _SLOT_TO_IDX: dict[str, int] = {s: i for i, s in enumerate(SLOTS)}
@@ -107,16 +100,12 @@ N_OHLCV: int = len(OHLCV_COLS)  # 19
 CLIP_VAL: float = 5.0
 
 
-def _signed_log(x: np.ndarray) -> np.ndarray:
-    return np.sign(x) * np.log1p(np.abs(x))
-
-
 def n_features(config: dict) -> int:
     """Total feature count for the given config."""
     mode = config.get("feature_mode", "ofi")
     n = config.get("n_lob_levels", N_LEVELS)
     if mode == "ofi":
-        return N_OFI + N_OHLCV  # 499
+        return N_OFI + N_OHLCV  # 259
     else:  # lob
         return 4 * n + N_OHLCV  # 59 for n=10
 
@@ -125,10 +114,7 @@ def n_features(config: dict) -> int:
 
 
 def compute_ofi_tick(df: pd.DataFrame) -> pd.DataFrame:
-    """Compute Cont-OFI for all 10 levels at each tick (crypto convention).
-
-    Bid and ask OFI are stored separately with a signed-log transform,
-    matching the crypto feature pipeline.
+    """Compute signed Cont-OFI for all 10 levels at each tick.
 
     Args:
         df: One day's intraday LOB snapshot data with columns
@@ -137,8 +123,7 @@ def compute_ofi_tick(df: pd.DataFrame) -> pd.DataFrame:
             (0-indexed, best bid/ask at level 0).
 
     Returns:
-        DataFrame with columns ``bofi_0 … bofi_9``, ``aofi_0 … aofi_9``
-        (20 columns total), aligned to ``df``.
+        DataFrame with columns ``ofi_0 … ofi_9``, aligned to ``df``.
     """
     result = pd.DataFrame(index=df.index)
     for i in range(N_LEVELS):
@@ -159,8 +144,7 @@ def compute_ofi_tick(df: pd.DataFrame) -> pd.DataFrame:
             df[f"ask_volume_{i}"],
             np.where(dp_a > 0, -prev_av, df[f"ask_volume_{i}"] - prev_av),
         )
-        result[f"bofi_{i}"] = _signed_log(bofi)
-        result[f"aofi_{i}"] = _signed_log(aofi)
+        result[f"ofi_{i}"] = bofi - aofi
 
     result.iloc[0] = 0.0  # first tick has no prior state
     return result.fillna(0.0)
@@ -176,23 +160,19 @@ def snap_to_slots(ofi_df: pd.DataFrame, day_df: pd.DataFrame) -> np.ndarray:
 
     Args:
         ofi_df:  Per-tick OFI DataFrame (output of :func:`compute_ofi_tick`).
-                 Columns: ``bofi_0 … bofi_9``, ``aofi_0 … aofi_9``.
         day_df:  Companion rows with a ``time`` column.
 
     Returns:
-        ``(N_SLOTS, N_LEVELS * 2)`` float32 array; un-matched slots are zero.
-        Column order: bid OFI levels 0–9, then ask OFI levels 0–9.
+        ``(N_SLOTS, N_LEVELS)`` float32 array; un-matched slots are zero.
     """
-    all_cols = [f"bofi_{i}" for i in range(N_LEVELS)] + [
-        f"aofi_{i}" for i in range(N_LEVELS)
-    ]
-    ofi_arr = ofi_df[all_cols].values.astype(np.float32)  # (T, 2*N_LEVELS)
+    ofi_cols = [f"ofi_{i}" for i in range(N_LEVELS)]
+    ofi_arr = ofi_df[ofi_cols].values.astype(np.float32)
 
     # Accept both "HH:MM" and "HH:MM:SS" by stripping to first 5 chars for lookup
     times = day_df["time"].astype(str).str[:5]
     slot_idx = times.map(_SLOT_TO_IDX).to_numpy()
 
-    out = np.zeros((N_SLOTS, N_LEVELS * 2), dtype=np.float32)
+    out = np.zeros((N_SLOTS, N_LEVELS), dtype=np.float32)
     keep = ~pd.isna(slot_idx)
     if keep.any():
         valid_idx = slot_idx[keep].astype(np.int64)
