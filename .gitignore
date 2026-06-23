@@ -224,3 +224,5 @@ logs
 *.out
 
 .DS_store
+
+*.bak
