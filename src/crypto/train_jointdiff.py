@@ -1,8 +1,8 @@
 """Train JointDiffusion on crypto LOB data.
 
-Joint objective (Deja et al., 2023):
-    L = MSE(eps_hat, noise) + lambda_trend * w(t) * CE(logits, label)
-    w(t) = (1 - t/T_max)^2
+   Joint objective (Deja et al., 2023):
+       L = MSE(eps_hat, noise) + lambda_trend * w(t) * CE(logits, label)
+        w(t) = (1 - t/T_max)^2   when trend_taper else 1
 
 Usage::
 
@@ -38,6 +38,7 @@ def _train_epoch(model, sched, loader, optimizer, lr_sched, config, device):
     model.train()
     t_max = sched.config.num_train_timesteps
     lam = config.get("lambda_trend", 1.0)
+    trend_taper = config.get("trend_taper", True)
     grad_clip = config.get("grad_clip", 1.0)
     tot = dif = trd = 0.0
     n = 0
@@ -51,7 +52,10 @@ def _train_epoch(model, sched, loader, optimizer, lr_sched, config, device):
 
         eps_hat, logits = model(x_t, t)
         diff_loss = F.mse_loss(eps_hat, noise)
-        w = (1.0 - t.float() / t_max) ** 2
+        if trend_taper:
+            w = (1.0 - t.float() / t_max) ** 2
+        else:
+            w = 1.0
         cls_loss = (w * F.cross_entropy(logits, label, reduction="none")).mean()
         loss = diff_loss + lam * cls_loss
 
