@@ -63,7 +63,6 @@ from stocks.feishu.features import (
     causal_rolling_zscore,
     compute_ofi_tick,
     compute_ohlcv_features,
-    extract_lob_day,
     n_features,
     snap_to_slots,
 )
@@ -132,10 +131,8 @@ def _build_feature_matrix(
           NF          : feature count.
     """
     nf = n_features(config)
-    mode = config.get("feature_mode", "ofi")
     alpha = config["alpha"]
-    n_levels = config.get("n_lob_levels", N_LEVELS)
-    n_lob_feat = N_OFI if mode == "ofi" else 4 * n_levels
+    n_lob_feat = N_OFI
     root = Path(data_dir).resolve()
     sym_col = config.get("symbol_col", _SYM_COL)
     day_col = config.get("day_col", _DAY_COL)
@@ -196,7 +193,7 @@ def _build_feature_matrix(
         row_labels[lo:hi] = labels_map[sym]
         ohlcv_block[lo:hi] = ohlcv_raw_map[sym]
 
-    # ── Pass 2 (LOB, large): per-asset OFI/LOB features → feat[:, :n_lob] ────
+    # ── Pass 2 (LOB, large): per-asset OFI features → feat[:, :n_lob] ────
     lob_cols = [sym_col, day_col, time_col]
     for i in range(N_LEVELS):
         j = i + 1
@@ -225,11 +222,8 @@ def _build_feature_matrix(
             if k is None or len(day_lob) == 0:
                 continue
             day_lob = day_lob.reset_index(drop=True)
-            if mode == "ofi":
-                ofi_df = compute_ofi_tick(day_lob)
-                block[k] = snap_to_slots(ofi_df, day_lob).reshape(-1)  # (240,)
-            else:
-                block[k] = extract_lob_day(day_lob, n_levels)  # (4n,)
+            ofi_df = compute_ofi_tick(day_lob)
+            block[k] = snap_to_slots(ofi_df, day_lob).reshape(-1)  # (240,)
 
         block = causal_rolling_zscore(block)
         feat[lo:hi, :n_lob_feat] = np.clip(block, -CLIP_VAL, CLIP_VAL)

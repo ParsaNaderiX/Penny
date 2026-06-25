@@ -1,24 +1,12 @@
 """Feature engineering for Feishu A-share LOB + daily data.
 
-Two modes controlled by ``config["feature_mode"]``:
-
-  ``"ofi"`` — 24-slot intraday OFI (240) + 19 OHLCV  = 259 features
-  ``"lob"`` — closing-snapshot price/vol (4n) + 19 OHLCV = 4n+19 features
+Feature mode: 24-slot intraday OFI (240) + 19 OHLCV = 259 features.
 
 OFI features (240)
 ------------------
 24 intraday time slots × 10 LOB levels.  Slot OFI is placed at the exact
 10-min mark (09:40, 09:50, …); off-grid 5-min bars are zero-filled.
 Normalised with a causal 5-day rolling z-score (no lookahead).
-
-LOB features (4n for n levels)
--------------------------------
-Last intraday snapshot of each trading day:
-  [0   : n)    bid price offset  = (mid - bid_p[i]) / mid
-  [n   : 2n)   ask price offset  = (ask_p[i] - mid) / mid
-  [2n  : 3n)   log1p bid volume per level
-  [3n  : 4n)   log1p ask volume per level
-Normalised with per-asset causal 5-day rolling z-score.
 
 OHLCV features (19)
 -------------------
@@ -102,12 +90,7 @@ CLIP_VAL: float = 5.0
 
 def n_features(config: dict) -> int:
     """Total feature count for the given config."""
-    mode = config.get("feature_mode", "ofi")
-    n = config.get("n_lob_levels", N_LEVELS)
-    if mode == "ofi":
-        return N_OFI + N_OHLCV  # 259
-    else:  # lob
-        return 4 * n + N_OHLCV  # 59 for n=10
+    return N_OFI + N_OHLCV  # 259
 
 
 # ── tick-level OFI ────────────────────────────────────────────────────────────
@@ -219,42 +202,6 @@ def causal_rolling_zscore(
 
 
 # ── closing-snapshot LOB features ─────────────────────────────────────────────
-
-
-def extract_lob_day(day_df: pd.DataFrame, n_levels: int = N_LEVELS) -> np.ndarray:
-    """Extract LOB features from the last intraday snapshot of one trading day.
-
-    Args:
-        day_df:   One day's intraday data (any number of ticks); last row used.
-        n_levels: Number of LOB levels (default 10).
-
-    Returns:
-        ``(4 * n_levels,)`` float32: bid price offsets, ask price offsets,
-        log1p bid volumes, log1p ask volumes.
-    """
-    last = day_df.iloc[-1]
-    eps = 1e-12
-
-    bid_p = np.array(
-        [last[f"bid_price_{i}"] for i in range(n_levels)], dtype=np.float64
-    )
-    bid_v = np.array(
-        [last[f"bid_volume_{i}"] for i in range(n_levels)], dtype=np.float64
-    )
-    ask_p = np.array(
-        [last[f"ask_price_{i}"] for i in range(n_levels)], dtype=np.float64
-    )
-    ask_v = np.array(
-        [last[f"ask_volume_{i}"] for i in range(n_levels)], dtype=np.float64
-    )
-
-    mid = (bid_p[0] + ask_p[0]) / 2.0
-    bid_off = (mid - bid_p) / (mid + eps)
-    ask_off = (ask_p - mid) / (mid + eps)
-
-    return np.concatenate([bid_off, ask_off, np.log1p(bid_v), np.log1p(ask_v)]).astype(
-        np.float32
-    )
 
 
 # ── daily OHLCV features ──────────────────────────────────────────────────────
