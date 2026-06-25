@@ -140,7 +140,7 @@ def _build_feature_matrix(
     lob_file = config.get("lob_file", _LOB_FILE)
     daily_file = config.get("daily_file", _DAILY_FILE)
 
-    logger.info("building feishu features (RAM) mode={OFI} nf={}", nf)
+    logger.info("building feishu features (RAM) mode=OFI nf={}", nf)
 
     # ── Pass 1 (daily, small): per-asset OHLCV raw feats, labels, day order ──
     daily_all = pd.read_parquet(root / daily_file).rename(columns={day_col: "date"})
