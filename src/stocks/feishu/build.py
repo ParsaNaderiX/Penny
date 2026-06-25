@@ -42,7 +42,7 @@ Per-asset chronological split of that asset's windows:
 Public API
 ----------
 - discover_symbols(data_dir, config) → sorted list of symbol names (asset_id)
-- build_datasets(config, data_dir, cache_dir, symbols)
+- build_datasets(config, data_dir, symbols)
       → (train_ds, val_ds, test_ds, meta)
 """
 
@@ -269,16 +269,13 @@ def _asset_ranges(row_asset: np.ndarray) -> list[tuple[int, int]]:
 def build_datasets(
     config: dict,
     data_dir: str | Path,
-    cache_dir: str | Path,
     symbols: list[str],
 ) -> tuple[LOBDataset, LOBDataset, LOBDataset, dict]:
     """Return ``(train_ds, val_ds, test_ds, meta)`` over the in-RAM feature matrix.
 
     Windows are computed per asset (causal label, no straddling), then split
-    70 / 15 / 15 chronologically within each asset.
-
-    Note: ``cache_dir`` is accepted for API compatibility but unused — features
-    are built fresh in RAM each call (no disk cache).
+    70 / 15 / 15 chronologically within each asset.  Features are built fresh
+    in RAM each call — no disk cache.
     """
     T = config["T_past"]
     feat, row_labels, row_asset, nf = _build_feature_matrix(config, data_dir, symbols)

@@ -93,7 +93,6 @@ def main() -> None:
     logger.add(ckpt_dir / "train.log", level="DEBUG")
 
     data_dir = Path(config["data_dir"])
-    cache_dir = Path(config["cache_dir"])
     symbols = discover_symbols(data_dir, config)
     config["n_features"] = feishu_n_features(config)
     config["T_past"] = config.get("T_past", 50)
@@ -111,7 +110,7 @@ def main() -> None:
     )
 
     train_ds, val_ds, test_ds, meta = build_datasets(
-        config, data_dir, cache_dir, symbols
+        config, data_dir, symbols
     )
     cb = meta["class_balance"]
     logger.info(
