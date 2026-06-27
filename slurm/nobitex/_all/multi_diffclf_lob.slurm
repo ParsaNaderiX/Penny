@@ -1,9 +1,9 @@
 #!/bin/bash
-#SBATCH --job-name=penny-binance-penny-ofi
+#SBATCH --job-name=mdcf-nobitex-lob
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
-#SBATCH --cpus-per-task=8
-#SBATCH --mem=64G
+#SBATCH --cpus-per-task=4
+#SBATCH --mem=32G
 #SBATCH --gres=gpu:1
 #SBATCH -p gpu-all
 
@@ -12,7 +12,7 @@ set -euo pipefail
 ROOT_DIR="${SLURM_SUBMIT_DIR:-$(pwd)}"
 cd "$ROOT_DIR"
 
-echo "Penny [Binance] Penny OFI (all symbols) | host=$(hostname) | start=$(date)"
+echo "DiffusionClassifier multi [Nobitex] LOB | host=$(hostname) | start=$(date)"
 
 if command -v module >/dev/null 2>&1; then module purge || true; fi
 if [[ -n "${VENV_PATH:-}" ]]; then source "$VENV_PATH/bin/activate"; fi
@@ -34,8 +34,8 @@ else
     echo "UV_EXTRA=$UV_EXTRA (user override)"
 fi
 
-CONFIG="${CONFIG:-configs/crypto/binance/penny/all_ofi.json}"
+CONFIG="${CONFIG:-configs/crypto/nobitex/multi_diffclf/all_lob.json}"
 export UV_PROJECT_ENVIRONMENT=".venv-${UV_EXTRA}"
 uv sync --extra "$UV_EXTRA"
-uv run python -m crypto.train_penny "$CONFIG"
+uv run python -m crypto.train_multi_diffclf "$CONFIG"
 echo "done: $(date)"

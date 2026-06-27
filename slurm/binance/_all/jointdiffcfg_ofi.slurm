@@ -1,9 +1,9 @@
 #!/bin/bash
-#SBATCH --job-name=penny-nobitex-penny-lob
+#SBATCH --job-name=jdcfg-binance-ofi
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
-#SBATCH --cpus-per-task=4
-#SBATCH --mem=32G
+#SBATCH --cpus-per-task=8
+#SBATCH --mem=64G
 #SBATCH --gres=gpu:1
 #SBATCH -p gpu-all
 
@@ -12,7 +12,7 @@ set -euo pipefail
 ROOT_DIR="${SLURM_SUBMIT_DIR:-$(pwd)}"
 cd "$ROOT_DIR"
 
-echo "Penny [Nobitex] Penny LOB (all symbols) | host=$(hostname) | start=$(date)"
+echo "JointDiffCFG [Binance] OFI (all symbols) | host=$(hostname) | start=$(date)"
 
 if command -v module >/dev/null 2>&1; then module purge || true; fi
 if [[ -n "${VENV_PATH:-}" ]]; then source "$VENV_PATH/bin/activate"; fi
@@ -34,8 +34,8 @@ else
     echo "UV_EXTRA=$UV_EXTRA (user override)"
 fi
 
-CONFIG="${CONFIG:-configs/crypto/nobitex/penny/all_lob.json}"
+CONFIG="${CONFIG:-configs/crypto/binance/jointdiffcfg/all_ofi.json}"
 export UV_PROJECT_ENVIRONMENT=".venv-${UV_EXTRA}"
 uv sync --extra "$UV_EXTRA"
-uv run python -m crypto.train_penny "$CONFIG"
+uv run python -m crypto.train_jointdiffcfg "$CONFIG"
 echo "done: $(date)"

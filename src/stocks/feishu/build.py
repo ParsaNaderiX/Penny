@@ -117,18 +117,19 @@ def _build_feature_matrix(
     config: dict,
     data_dir: str | Path,
     symbols: list[str],
-) -> tuple[np.ndarray, np.ndarray, np.ndarray, int]:
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, int, list[str]]:
     """Build the per-(asset, day) feature matrix and row arrays in RAM.
 
     Built fresh from the parquet files every call — no disk cache — so the
     features always reflect the current normalisation code.
 
     Returns:
-        ``(feat, row_labels, row_asset, NF)`` where
-          feat        : ``(N_rows, NF)`` float32 array (in RAM).
-          row_labels  : ``(N_rows,)`` int64 causal labels (-1 = invalid).
-          row_asset   : ``(N_rows,)`` int64 asset index per row (contiguous).
-          NF          : feature count.
+        ``(feat, row_labels, row_asset, NF, ordered_syms)`` where
+          feat         : ``(N_rows, NF)`` float32 array (in RAM).
+          row_labels   : ``(N_rows,)`` int64 causal labels (-1 = invalid).
+          row_asset    : ``(N_rows,)`` int64 asset index per row (contiguous).
+          NF           : feature count.
+          ordered_syms : list[str] of symbols in row order.
     """
     nf = n_features(config)
     alpha = config["alpha"]
@@ -251,7 +252,7 @@ def _build_feature_matrix(
     # final safety net: no non-finite values ever reach the model
     np.nan_to_num(feat, copy=False, nan=0.0, posinf=CLIP_VAL, neginf=-CLIP_VAL)
     logger.info("feishu features built (in RAM): {:,} rows × {} feat", n_rows, nf)
-    return feat, row_labels, row_asset, nf
+    return feat, row_labels, row_asset, nf, ordered_syms
 
 
 # ── dataset factory ──────────────────────────────────────────────────────────
@@ -278,7 +279,9 @@ def build_datasets(
     in RAM each call — no disk cache.
     """
     T = config["T_past"]
-    feat, row_labels, row_asset, nf = _build_feature_matrix(config, data_dir, symbols)
+    feat, row_labels, row_asset, nf, _ordered_syms = _build_feature_matrix(
+        config, data_dir, symbols
+    )
 
     train_starts: list[int] = []
     val_starts: list[int] = []
@@ -327,4 +330,72 @@ def build_datasets(
     train_ds = LOBDataset(feat, train_arr, row_labels, T)
     val_ds = LOBDataset(feat, val_arr, row_labels, T)
     test_ds = LOBDataset(feat, test_arr, row_labels, T)
+    return train_ds, val_ds, test_ds, meta
+
+
+def build_datasets_multi(
+    config: dict,
+    data_dir: str | Path,
+    symbols: list[str],
+) -> tuple[LOBDataset, LOBDataset, LOBDataset, dict]:
+    """Like :func:`build_datasets` but exposes asset ids in each batch item.
+
+    Each ``__getitem__`` returns ``{"x":…, "label":…, "asset": int}``, where
+    ``asset`` is the integer index into ``ordered_syms``.  Use this for any
+    model that conditions on asset identity (e.g. JointDiffCFG).
+
+    Extra ``meta`` keys vs. :func:`build_datasets`:
+        ``n_assets``  — number of distinct assets.
+        ``symbols``   — ordered list of symbol strings.
+    """
+    T = config["T_past"]
+    feat, row_labels, row_asset, nf, ordered_syms = _build_feature_matrix(
+        config, data_dir, symbols
+    )
+
+    train_starts: list[int] = []
+    val_starts: list[int] = []
+    test_starts: list[int] = []
+
+    for lo, hi in _asset_ranges(row_asset):
+        asset_starts = [s for s in range(lo, hi - T) if row_labels[s + T] >= 0]
+        if not asset_starts:
+            continue
+        n = len(asset_starts)
+        n_train = int(_TRAIN_FRAC * n)
+        n_val = int(_VAL_CUM * n)
+        train_starts.extend(asset_starts[:n_train])
+        val_starts.extend(asset_starts[n_train:n_val])
+        test_starts.extend(asset_starts[n_val:])
+
+    train_arr = np.asarray(train_starts, dtype=np.int64)
+    val_arr = np.asarray(val_starts, dtype=np.int64)
+    test_arr = np.asarray(test_starts, dtype=np.int64)
+
+    def _balance(starts: np.ndarray) -> dict:
+        if len(starts) == 0:
+            return {"down": 0.0, "stationary": 0.0, "up": 0.0}
+        lbl = row_labels[starts + T]
+        c = np.bincount(lbl, minlength=3) / len(lbl)
+        return {"down": float(c[0]), "stationary": float(c[1]), "up": float(c[2])}
+
+    meta = {
+        "counts": {"train": len(train_arr), "val": len(val_arr), "test": len(test_arr)},
+        "class_balance": _balance(train_arr),
+        "n_features": nf,
+        "n_rows": len(row_asset),
+        "n_assets": len(ordered_syms),
+        "symbols": ordered_syms,
+    }
+    logger.info(
+        "multi windows — train:{} val:{} test:{} n_assets:{}",
+        meta["counts"]["train"],
+        meta["counts"]["val"],
+        meta["counts"]["test"],
+        meta["n_assets"],
+    )
+
+    train_ds = LOBDataset(feat, train_arr, row_labels, T, row_asset=row_asset)
+    val_ds = LOBDataset(feat, val_arr, row_labels, T, row_asset=row_asset)
+    test_ds = LOBDataset(feat, test_arr, row_labels, T, row_asset=row_asset)
     return train_ds, val_ds, test_ds, meta

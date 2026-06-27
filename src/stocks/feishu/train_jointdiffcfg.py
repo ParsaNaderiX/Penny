@@ -1,8 +1,8 @@
-"""Train Penny across all symbols of one exchange.
+"""Train JointDiffCFG (Penny) across all Feishu A-share stock symbols.
 
-A single model is trained on every coin at once:
+A single model is trained on every stock at once:
   * the diffusion branch is conditioned on the asset id (classifier-free, with
-    condition dropout) → it learns each coin's LOB distribution ``p(x | asset)``;
+    condition dropout) → it learns each stock's LOB distribution ``p(x | asset)``;
   * a trend head on the bottleneck predicts price trend (down/stat/up), CE loss.
 
 Loss::
@@ -10,12 +10,14 @@ Loss::
     L = MSE(eps_hat, noise) + lambda_trend * w(t) * CE(logits, label)
         w(t) = (1 - t/T_max)^2   when trend_taper else 1
 
-The trend CE is computed only on samples whose asset was *not* dropped (the head
-needs the true asset; test always conditions on the known coin).
+The trend CE is computed only on samples whose asset was *not* dropped.
+
+Evaluation: overall accuracy + macro-F1 only (no per-asset breakdown;
+feishu has hundreds of stocks so per-asset tables would be unwieldy).
 
 Usage::
 
-    uv run python -m crypto.train_penny configs/crypto/binance/penny/all_ofi.json
+    uv run python -m stocks.feishu.train_jointdiffcfg configs/stocks/feishu/penny_ofi.json
 """
 
 from __future__ import annotations
@@ -30,17 +32,16 @@ from pathlib import Path
 os.environ.setdefault("TORCHDYNAMO_DISABLE", "1")
 os.environ.setdefault("TORCH_COMPILE_DISABLE", "1")
 
-import numpy as np
 import torch
 import torch.nn.functional as F
 from loguru import logger
-from sklearn.metrics import confusion_matrix, f1_score
 from torch.optim import AdamW
 from torch.utils.data import DataLoader
 
-from crypto.multi_dataset import build_multi_datasets
 from models.ddpm import DDPMScheduler
-from models.penny import Penny, count_parameters
+from models.jointdiffcfg import JointDiffCFG, count_parameters
+from stocks.feishu.build import build_datasets_multi, discover_symbols
+from stocks.feishu.features import n_features as feishu_n_features
 from utils.evaluate import run_test
 from utils.training import (
     build_cosine_schedule,
@@ -70,7 +71,6 @@ def _train_epoch(model, sched, loader, optimizer, lr_sched, config, device):
         noise = torch.randn_like(x0)
         x_t = sched.add_noise(x0, noise, t)
 
-        # classifier-free condition dropout on the asset
         drop = torch.rand(b, device=device) < p_uncond
         asset_in = asset.clone()
         asset_in[drop] = null_asset
@@ -78,15 +78,16 @@ def _train_epoch(model, sched, loader, optimizer, lr_sched, config, device):
         eps_hat, logits = model(x_t, t, asset_in)
         diff_loss = F.mse_loss(eps_hat, noise)
 
-        # trend CE only on samples that kept their (true) asset condition
         keep = ~drop
         if keep.any():
-            if trend_taper:
-                w = (1.0 - t.float() / t_max) ** 2
-            else:
-                w = torch.ones(b, device=device)
-            ce = F.cross_entropy(logits[keep], label[keep], reduction="none")
-            cls_loss = (w[keep] * ce).mean()
+            w = (
+                (1.0 - t.float() / t_max) ** 2
+                if trend_taper
+                else torch.ones(b, device=device)
+            )
+            cls_loss = (
+                w[keep] * F.cross_entropy(logits[keep], label[keep], reduction="none")
+            ).mean()
         else:
             cls_loss = torch.zeros((), device=device)
         loss = diff_loss + lam * cls_loss
@@ -117,67 +118,10 @@ def _validate(model, loader, device):
     return ce / max(len(loader), 1), correct / max(n, 1)
 
 
-@torch.no_grad()
-def _per_asset_metrics(model, dataset, config, device, symbols, split_name):
-    """Per-coin accuracy / macro-F1 / confusion on *dataset*.
-
-    Every sample is classified conditioned on its own (known) asset id, then
-    grouped by coin.  Logs accuracy + macro-F1 + support per coin and a pooled
-    ``ALL`` row, and returns a JSON-serialisable dict.
-    """
-    model.eval()
-    loader = DataLoader(dataset, batch_size=config["batch_size"], shuffle=False)
-    bucket: dict = {}  # asset_idx -> ([y_true], [y_pred])
-    for batch in loader:
-        preds = model.predict(batch, device).argmax(1).cpu().tolist()
-        for asset, pred, label in zip(
-            batch["asset"].tolist(), preds, batch["label"].tolist()
-        ):
-            yt, yp = bucket.setdefault(asset, ([], []))
-            yt.append(label)
-            yp.append(pred)
-
-    logger.info("{}  per-asset metrics:", split_name)
-    out: dict = {}
-    all_true: list = []
-    all_pred: list = []
-    for asset in sorted(bucket):
-        yt = np.array(bucket[asset][0])
-        yp = np.array(bucket[asset][1])
-        all_true.extend(yt.tolist())
-        all_pred.extend(yp.tolist())
-        acc = float((yt == yp).mean()) if len(yt) else 0.0
-        f1 = float(f1_score(yt, yp, average="macro", labels=[0, 1, 2], zero_division=0))
-        cm = confusion_matrix(yt, yp, labels=[0, 1, 2])
-        logger.info(
-            "    {:<10} acc={:.4f} macro_f1={:.4f} n={}",
-            symbols[asset],
-            acc,
-            f1,
-            len(yt),
-        )
-        out[symbols[asset]] = {
-            "accuracy": acc,
-            "macro_f1": f1,
-            "n": int(len(yt)),
-            "confusion": cm.tolist(),
-        }
-
-    yt = np.array(all_true)
-    yp = np.array(all_pred)
-    acc = float((yt == yp).mean()) if len(yt) else 0.0
-    f1 = float(f1_score(yt, yp, average="macro", labels=[0, 1, 2], zero_division=0))
-    logger.info("    {:<10} acc={:.4f} macro_f1={:.4f} n={}", "ALL", acc, f1, len(yt))
-    out["ALL"] = {"accuracy": acc, "macro_f1": f1, "n": int(len(yt))}
-    return out
-
-
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument(
-        "config",
-        nargs="?",
-        default="configs/crypto/binance/penny/all_ofi.json",
+        "config", nargs="?", default="configs/stocks/feishu/penny_ofi.json"
     )
     args = parser.parse_args()
 
@@ -193,33 +137,31 @@ def main() -> None:
 
     device = resolve_device(config["device"])
     stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    ckpt_dir = (
-        Path(config["checkpoint_dir"])
-        / f"penny_{config.get('feature_mode', '')}_{stamp}"
-    )
+    ckpt_dir = Path(config["checkpoint_dir"]) / f"penny_ofi_{stamp}"
     ckpt_dir.mkdir(parents=True, exist_ok=True)
     logger.add(ckpt_dir / "train.log", level="DEBUG")
 
-    logger.info(
-        "Penny  exchange={}  mode={}  symbols={}",
-        config.get("exchange"),
-        config.get("feature_mode"),
-        config["symbols"],
-    )
-    train_ds, val_ds, test_ds, meta = build_multi_datasets(config)
-    config["n_features"] = meta["n_features"]
+    data_dir = Path(config["data_dir"])
+    symbols = discover_symbols(data_dir, config)
+    config["n_features"] = feishu_n_features(config)
+    config["T_past"] = config.get("T_past", 50)
+
+    train_ds, val_ds, test_ds, meta = build_datasets_multi(config, data_dir, symbols)
     config["n_assets"] = meta["n_assets"]
-    symbols = meta["symbols"]
     cb = meta["class_balance"]
     logger.info(
-        "  windows train={} val={} test={}  n_assets={}",
+        "JointDiffCFG [Feishu]  mode=OFI  n_assets={}  n_features={}",
+        meta["n_assets"],
+        config["n_features"],
+    )
+    logger.info(
+        "  windows  train={}  val={}  test={}",
         meta["counts"]["train"],
         meta["counts"]["val"],
         meta["counts"]["test"],
-        meta["n_assets"],
     )
     logger.info(
-        "  train balance  down={:.1%} flat={:.1%} up={:.1%}",
+        "  train balance  down={:.1%} stat={:.1%} up={:.1%}",
         cb["down"],
         cb["stationary"],
         cb["up"],
@@ -232,7 +174,7 @@ def main() -> None:
         beta_schedule="linear",
         clip_sample=False,
     )
-    model = Penny(config).to(device)
+    model = JointDiffCFG(config).to(device)
     logger.info(
         "  params={:.2f}M  lambda_trend={}  p_uncond={}  device={}",
         count_parameters(model) / 1e6,
@@ -280,13 +222,7 @@ def main() -> None:
         if val_ce < best:
             best, patience = val_ce, 0
             torch.save(
-                {
-                    "model": model.state_dict(),
-                    "config": config,
-                    "alphas": meta["alphas"],
-                    "symbols": symbols,
-                    "epoch": epoch,
-                },
+                {"model": model.state_dict(), "config": config, "epoch": epoch},
                 ckpt_dir / "best.pt",
             )
         else:
@@ -300,11 +236,6 @@ def main() -> None:
     ckpt = torch.load(ckpt_dir / "best.pt", map_location=device, weights_only=False)
     model.load_state_dict(ckpt["model"])
     run_test(model, test_ds, config, device)
-    val_metrics = _per_asset_metrics(model, val_ds, config, device, symbols, "VAL")
-    test_metrics = _per_asset_metrics(model, test_ds, config, device, symbols, "TEST")
-    (ckpt_dir / "per_asset_metrics.json").write_text(
-        json.dumps({"val": val_metrics, "test": test_metrics}, indent=2)
-    )
 
 
 if __name__ == "__main__":

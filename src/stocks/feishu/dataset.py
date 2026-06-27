@@ -32,17 +32,21 @@ class LOBDataset(Dataset):
         starts: np.ndarray,
         labels: np.ndarray,
         t_past: int,
+        row_asset: np.ndarray | None = None,
     ) -> None:
         """Args:
-        feat:   ``(N_rows, NF)`` float32 array of pre-normalised features (in RAM).
-        starts: ``(N_windows,)`` int64 window start rows (within one asset).
-        labels: ``(N_rows,)`` int64 per-row causal labels (-1 = invalid).
-        t_past: Window length in trading days.
+        feat:      ``(N_rows, NF)`` float32 feature matrix (in RAM).
+        starts:    ``(N_windows,)`` int64 window start rows (within one asset).
+        labels:    ``(N_rows,)`` int64 per-row causal labels (-1 = invalid).
+        t_past:    Window length in trading days.
+        row_asset: Optional ``(N_rows,)`` int64 asset index per row.  When
+                   provided, each batch item includes an ``"asset"`` key.
         """
         self.feat = feat
         self.starts = starts
         self.labels = labels
         self.t_past = t_past
+        self.row_asset = row_asset
 
     def __len__(self) -> int:
         return len(self.starts)
@@ -51,7 +55,10 @@ class LOBDataset(Dataset):
         s = int(self.starts[idx])
         window = self.feat[s : s + self.t_past].astype(np.float32)  # (T, NF)
         x = torch.from_numpy(window.copy()).unsqueeze(0)  # (1, T, NF)
-        return {
+        out: dict = {
             "x": x,
             "label": torch.tensor(int(self.labels[s + self.t_past]), dtype=torch.long),
         }
+        if self.row_asset is not None:
+            out["asset"] = int(self.row_asset[s])
+        return out
