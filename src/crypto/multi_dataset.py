@@ -14,8 +14,11 @@ were already run.
 
 ``config`` keys (in addition to the usual single-symbol ones)
 ------------------------------------------------------------
-symbols    : list[str]  — the coins to pool (e.g. all Binance pairs)
-cache_root : str        — parent cache dir; per-symbol cache is ``cache_root/SYMBOL``
+symbols      : list[str]        — the coins to pool (e.g. all Binance pairs)
+cache_root   : str              — parent cache dir; per-symbol cache is ``cache_root/SYMBOL``
+symbol_alphas: dict[str, float] — optional per-symbol alpha overrides, e.g.
+               ``{"USDCUSDT": 3e-6}``.  Symbols not listed fall back to
+               ``label_alpha`` (auto-calibrate if -1).
 """
 
 from __future__ import annotations
@@ -86,10 +89,14 @@ def build_multi_datasets(config: dict):
     tr_items, va_items, te_items = [], [], []
     F_ref: int | None = None
 
+    symbol_alphas = config.get("symbol_alphas", {})
+
     for idx, symbol in enumerate(symbols):
         sub = copy.deepcopy(config)
         sub["symbol"] = symbol
         sub["cache_dir"] = str(cache_root / symbol)
+        if symbol in symbol_alphas:
+            sub["label_alpha"] = float(symbol_alphas[symbol])
 
         feat, mid, ts = build_cache(sub, extract_features, n_features, tag="lob")
         F = feat.shape[1]

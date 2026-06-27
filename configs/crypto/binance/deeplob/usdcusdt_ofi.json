@@ -8,7 +8,7 @@
   "feature_mode": "ofi",
   "T_past": 60,
   "label_k": 10,
-  "label_alpha": -1,
+  "label_alpha": 3e-06,
   "train_frac": 0.7,
   "val_frac": 0.15,
   "stride": 1,

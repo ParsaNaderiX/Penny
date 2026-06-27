@@ -33,5 +33,8 @@
   "epochs": 80,
   "patience": 15,
   "device": "cuda",
-  "seed": 42
+  "seed": 42,
+  "symbol_alphas": {
+    "USDCUSDT": 3e-06
+  }
 }
