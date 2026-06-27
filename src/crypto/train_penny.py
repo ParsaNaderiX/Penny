@@ -98,7 +98,7 @@ def _train_epoch(model, sched, loader, optimizer, lr_sched, config, device):
         lr_sched.step()
         tot += loss.item()
         dif += diff_loss.item()
-        trd += float(cls_loss)
+        trd += cls_loss.item()
         n += 1
     n = max(n, 1)
     return {"total": tot / n, "diff": dif / n, "trend": trd / n}
