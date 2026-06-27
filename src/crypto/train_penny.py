@@ -1,12 +1,21 @@
-"""Train JointDiffusion on crypto LOB data.
+"""Train Penny across all symbols of one exchange.
 
-   Joint objective (Deja et al., 2023):
-       L = MSE(eps_hat, noise) + lambda_trend * w(t) * CE(logits, label)
+A single model is trained on every coin at once:
+  * the diffusion branch is conditioned on the asset id (classifier-free, with
+    condition dropout) → it learns each coin's LOB distribution ``p(x | asset)``;
+  * a trend head on the bottleneck predicts price trend (down/stat/up), CE loss.
+
+Loss::
+
+    L = MSE(eps_hat, noise) + lambda_trend * w(t) * CE(logits, label)
         w(t) = (1 - t/T_max)^2   when trend_taper else 1
+
+The trend CE is computed only on samples whose asset was *not* dropped (the head
+needs the true asset; test always conditions on the known coin).
 
 Usage::
 
-    uv run python -m crypto.train_jointdiff configs/crypto/binance/jointdiff/btcusdt_ofi.json
+    uv run python -m crypto.train_penny configs/crypto/binance/penny/all_ofi.json
 """
 
 from __future__ import annotations
@@ -21,14 +30,17 @@ from pathlib import Path
 os.environ.setdefault("TORCHDYNAMO_DISABLE", "1")
 os.environ.setdefault("TORCH_COMPILE_DISABLE", "1")
 
+import numpy as np
 import torch
 import torch.nn.functional as F
-from models.ddpm import DDPMScheduler
 from loguru import logger
+from sklearn.metrics import confusion_matrix, f1_score
 from torch.optim import AdamW
 from torch.utils.data import DataLoader
 
-from crypto.dataset import build_datasets
+from crypto.multi_dataset import build_multi_datasets
+from models.ddpm import DDPMScheduler
+from models.penny import Penny, count_parameters
 from utils.evaluate import run_test
 from utils.training import (
     build_cosine_schedule,
@@ -37,7 +49,6 @@ from utils.training import (
     seed_worker,
     set_seed,
 )
-from models.jointdiff import JointDiffusion, count_parameters
 
 
 def _train_epoch(model, sched, loader, optimizer, lr_sched, config, device):
@@ -46,23 +57,38 @@ def _train_epoch(model, sched, loader, optimizer, lr_sched, config, device):
     lam = config.get("lambda_trend", 1.0)
     trend_taper = config.get("trend_taper", False)
     grad_clip = config.get("grad_clip", 1.0)
+    p_uncond = model.p_uncond
+    null_asset = model.null_asset
     tot = dif = trd = 0.0
     n = 0
     for batch in loader:
         x0 = batch["x"].to(device).float()
         label = batch["label"].to(device)
+        asset = batch["asset"].to(device)
         b = x0.shape[0]
         t = torch.randint(0, t_max, (b,), device=device)
         noise = torch.randn_like(x0)
         x_t = sched.add_noise(x0, noise, t)
 
-        eps_hat, logits = model(x_t, t)
+        # classifier-free condition dropout on the asset
+        drop = torch.rand(b, device=device) < p_uncond
+        asset_in = asset.clone()
+        asset_in[drop] = null_asset
+
+        eps_hat, logits = model(x_t, t, asset_in)
         diff_loss = F.mse_loss(eps_hat, noise)
-        if trend_taper:
-            w = (1.0 - t.float() / t_max) ** 2
+
+        # trend CE only on samples that kept their (true) asset condition
+        keep = ~drop
+        if keep.any():
+            if trend_taper:
+                w = (1.0 - t.float() / t_max) ** 2
+            else:
+                w = torch.ones(b, device=device)
+            ce = F.cross_entropy(logits[keep], label[keep], reduction="none")
+            cls_loss = (w[keep] * ce).mean()
         else:
-            w = 1.0
-        cls_loss = (w * F.cross_entropy(logits, label, reduction="none")).mean()
+            cls_loss = torch.zeros((), device=device)
         loss = diff_loss + lam * cls_loss
 
         optimizer.zero_grad()
@@ -72,7 +98,7 @@ def _train_epoch(model, sched, loader, optimizer, lr_sched, config, device):
         lr_sched.step()
         tot += loss.item()
         dif += diff_loss.item()
-        trd += cls_loss.item()
+        trd += float(cls_loss)
         n += 1
     n = max(n, 1)
     return {"total": tot / n, "diff": dif / n, "trend": trd / n}
@@ -91,12 +117,67 @@ def _validate(model, loader, device):
     return ce / max(len(loader), 1), correct / max(n, 1)
 
 
+@torch.no_grad()
+def _per_asset_metrics(model, dataset, config, device, symbols, split_name):
+    """Per-coin accuracy / macro-F1 / confusion on *dataset*.
+
+    Every sample is classified conditioned on its own (known) asset id, then
+    grouped by coin.  Logs accuracy + macro-F1 + support per coin and a pooled
+    ``ALL`` row, and returns a JSON-serialisable dict.
+    """
+    model.eval()
+    loader = DataLoader(dataset, batch_size=config["batch_size"], shuffle=False)
+    bucket: dict = {}  # asset_idx -> ([y_true], [y_pred])
+    for batch in loader:
+        preds = model.predict(batch, device).argmax(1).cpu().tolist()
+        for asset, pred, label in zip(
+            batch["asset"].tolist(), preds, batch["label"].tolist()
+        ):
+            yt, yp = bucket.setdefault(asset, ([], []))
+            yt.append(label)
+            yp.append(pred)
+
+    logger.info("{}  per-asset metrics:", split_name)
+    out: dict = {}
+    all_true: list = []
+    all_pred: list = []
+    for asset in sorted(bucket):
+        yt = np.array(bucket[asset][0])
+        yp = np.array(bucket[asset][1])
+        all_true.extend(yt.tolist())
+        all_pred.extend(yp.tolist())
+        acc = float((yt == yp).mean()) if len(yt) else 0.0
+        f1 = float(f1_score(yt, yp, average="macro", labels=[0, 1, 2], zero_division=0))
+        cm = confusion_matrix(yt, yp, labels=[0, 1, 2])
+        logger.info(
+            "    {:<10} acc={:.4f} macro_f1={:.4f} n={}",
+            symbols[asset],
+            acc,
+            f1,
+            len(yt),
+        )
+        out[symbols[asset]] = {
+            "accuracy": acc,
+            "macro_f1": f1,
+            "n": int(len(yt)),
+            "confusion": cm.tolist(),
+        }
+
+    yt = np.array(all_true)
+    yp = np.array(all_pred)
+    acc = float((yt == yp).mean()) if len(yt) else 0.0
+    f1 = float(f1_score(yt, yp, average="macro", labels=[0, 1, 2], zero_division=0))
+    logger.info("    {:<10} acc={:.4f} macro_f1={:.4f} n={}", "ALL", acc, f1, len(yt))
+    out["ALL"] = {"accuracy": acc, "macro_f1": f1, "n": int(len(yt))}
+    return out
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument(
         "config",
         nargs="?",
-        default="configs/crypto/binance/jointdiff/btcusdt_ofi.json",
+        default="configs/crypto/binance/penny/all_ofi.json",
     )
     args = parser.parse_args()
 
@@ -114,24 +195,31 @@ def main() -> None:
     stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     ckpt_dir = (
         Path(config["checkpoint_dir"])
-        / f"jointdiff_{config['symbol']}_{config.get('feature_mode', '')}_{stamp}"
+        / f"penny_{config.get('feature_mode', '')}_{stamp}"
     )
     ckpt_dir.mkdir(parents=True, exist_ok=True)
     logger.add(ckpt_dir / "train.log", level="DEBUG")
 
-    train_ds, val_ds, test_ds, alpha, meta = build_datasets(config)
-    config["n_features"] = meta["n_features"]
-    cb = meta["class_balance"]
-
     logger.info(
-        "JointDiffusion  symbol={}  mode={}",
-        config["symbol"],
+        "Penny  exchange={}  mode={}  symbols={}",
+        config.get("exchange"),
         config.get("feature_mode"),
+        config["symbols"],
     )
-    logger.info("  windows train={} val={} test={}", *meta["counts"].values())
+    train_ds, val_ds, test_ds, meta = build_multi_datasets(config)
+    config["n_features"] = meta["n_features"]
+    config["n_assets"] = meta["n_assets"]
+    symbols = meta["symbols"]
+    cb = meta["class_balance"]
     logger.info(
-        "  alpha={:.6f}  down={:.1%} flat={:.1%} up={:.1%}",
-        alpha,
+        "  windows train={} val={} test={}  n_assets={}",
+        meta["counts"]["train"],
+        meta["counts"]["val"],
+        meta["counts"]["test"],
+        meta["n_assets"],
+    )
+    logger.info(
+        "  train balance  down={:.1%} flat={:.1%} up={:.1%}",
         cb["down"],
         cb["stationary"],
         cb["up"],
@@ -144,11 +232,12 @@ def main() -> None:
         beta_schedule="linear",
         clip_sample=False,
     )
-    model = JointDiffusion(config).to(device)
+    model = Penny(config).to(device)
     logger.info(
-        "  params={:.2f}M  lambda_trend={}  device={}",
+        "  params={:.2f}M  lambda_trend={}  p_uncond={}  device={}",
         count_parameters(model) / 1e6,
         config.get("lambda_trend", 1.0),
+        model.p_uncond,
         device,
     )
 
@@ -194,7 +283,8 @@ def main() -> None:
                 {
                     "model": model.state_dict(),
                     "config": config,
-                    "alpha": alpha,
+                    "alphas": meta["alphas"],
+                    "symbols": symbols,
                     "epoch": epoch,
                 },
                 ckpt_dir / "best.pt",
@@ -210,6 +300,11 @@ def main() -> None:
     ckpt = torch.load(ckpt_dir / "best.pt", map_location=device, weights_only=False)
     model.load_state_dict(ckpt["model"])
     run_test(model, test_ds, config, device)
+    val_metrics = _per_asset_metrics(model, val_ds, config, device, symbols, "VAL")
+    test_metrics = _per_asset_metrics(model, test_ds, config, device, symbols, "TEST")
+    (ckpt_dir / "per_asset_metrics.json").write_text(
+        json.dumps({"val": val_metrics, "test": test_metrics}, indent=2)
+    )
 
 
 if __name__ == "__main__":

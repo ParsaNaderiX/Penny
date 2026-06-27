@@ -41,7 +41,7 @@ def _train_epoch(model, sched, loader, optimizer, lr_sched, config, device):
     model.train()
     t_max = sched.config.num_train_timesteps
     lam = config.get("lambda_trend", 1.0)
-    trend_taper = config.get("trend_taper", True)
+    trend_taper = config.get("trend_taper", False)
     grad_clip = config.get("grad_clip", 1.0)
     tot = dif = trd = 0.0
     n = 0
@@ -140,9 +140,7 @@ def main() -> None:
         device,
     )
 
-    train_ds, val_ds, test_ds, meta = build_datasets(
-        config, data_dir, symbols
-    )
+    train_ds, val_ds, test_ds, meta = build_datasets(config, data_dir, symbols)
     cb = meta["class_balance"]
     logger.info(
         "  windows  train={}  val={}  test={}", len(train_ds), len(val_ds), len(test_ds)

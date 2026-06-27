@@ -107,9 +107,7 @@ def main() -> None:
         "  params={:.2f}M  device={}", count_parameters(DeepLOB(config)) / 1e6, device
     )
 
-    train_ds, val_ds, test_ds, meta = build_datasets(
-        config, data_dir, symbols
-    )
+    train_ds, val_ds, test_ds, meta = build_datasets(config, data_dir, symbols)
     cb = meta["class_balance"]
     logger.info(
         "  windows  train={}  val={}  test={}", len(train_ds), len(val_ds), len(test_ds)
