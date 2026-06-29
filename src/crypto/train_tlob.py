@@ -96,11 +96,16 @@ def main() -> None:
     config["n_features"] = meta["n_features"]
     cb = meta["class_balance"]
 
-    logger.info("TLOB  symbol={}  mode={}", config["symbol"], config.get("feature_mode"))
+    logger.info(
+        "TLOB  symbol={}  mode={}", config["symbol"], config.get("feature_mode")
+    )
     logger.info("  windows train={} val={} test={}", *meta["counts"].values())
     logger.info(
         "  alpha={:.6f}  down={:.1%} flat={:.1%} up={:.1%}",
-        alpha, cb["down"], cb["stationary"], cb["up"],
+        alpha,
+        cb["down"],
+        cb["stationary"],
+        cb["up"],
     )
     logger.info(
         "  features={}  params={:.2f}M  dim={}  blocks={}  heads={}",
@@ -124,23 +129,39 @@ def main() -> None:
     )
     val_loader = DataLoader(val_ds, batch_size=config["batch_size"], shuffle=False)
 
-    optimizer = AdamW(model.parameters(), lr=config["lr"], weight_decay=config["weight_decay"])
-    scheduler = build_cosine_schedule(optimizer, config, config["epochs"] * len(train_loader))
+    optimizer = AdamW(
+        model.parameters(), lr=config["lr"], weight_decay=config["weight_decay"]
+    )
+    scheduler = build_cosine_schedule(
+        optimizer, config, config["epochs"] * len(train_loader)
+    )
 
     best, patience, history = float("inf"), 0, []
     for epoch in range(config["epochs"]):
-        tr_ce = _train_epoch(model, train_loader, optimizer, scheduler, device, grad_clip)
+        tr_ce = _train_epoch(
+            model, train_loader, optimizer, scheduler, device, grad_clip
+        )
         val_ce, val_acc = _validate(model, val_loader, device)
         logger.info(
             "epoch {} | tr={:.4f} val_ce={:.4f} val_acc={:.4f}",
-            epoch, tr_ce, val_ce, val_acc,
+            epoch,
+            tr_ce,
+            val_ce,
+            val_acc,
         )
-        history.append({"epoch": epoch, "train_ce": tr_ce, "val_ce": val_ce, "val_acc": val_acc})
+        history.append(
+            {"epoch": epoch, "train_ce": tr_ce, "val_ce": val_ce, "val_acc": val_acc}
+        )
 
         if val_ce < best:
             best, patience = val_ce, 0
             torch.save(
-                {"model": model.state_dict(), "config": config, "alpha": alpha, "epoch": epoch},
+                {
+                    "model": model.state_dict(),
+                    "config": config,
+                    "alpha": alpha,
+                    "epoch": epoch,
+                },
                 ckpt_dir / "best.pt",
             )
         else:
