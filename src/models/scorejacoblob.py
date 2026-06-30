@@ -139,7 +139,7 @@ class Up2D(nn.Module):
 
 
 class DiffBackbone2D(nn.Module):
-    """2-D U-Net over (time × feature) with bottleneck self-attention (v-prediction).
+    """2-D U-Net over (time × feature) with a bottleneck MLP (v-prediction).
 
     Input:  (B, 1, T, F) — single-channel LOB window
     Output: (B, 1, T, F) via forward_v, or (B, C_b, T_b, F_b) via bottleneck
@@ -152,6 +152,7 @@ class DiffBackbone2D(nn.Module):
         temb_dim: int,
         heads: int,
         use_checkpoint: bool = True,
+        mlp_ratio: int = 4,
     ) -> None:
         super().__init__()
         self.temb_dim = temb_dim
@@ -165,8 +166,12 @@ class DiffBackbone2D(nn.Module):
         self.downs = nn.ModuleList(
             Down2D(chans[i], chans[i + 1], temb_dim) for i in range(depth)
         )
-        self.attn = nn.MultiheadAttention(chans[-1], heads, batch_first=True)
-        self.attn_norm = nn.LayerNorm(chans[-1])
+        self.mlp = nn.Sequential(
+            nn.Linear(chans[-1], chans[-1] * mlp_ratio),
+            nn.GELU(),
+            nn.Linear(chans[-1] * mlp_ratio, chans[-1]),
+        )
+        self.mlp_norm = nn.LayerNorm(chans[-1])
         self.ups = nn.ModuleList(
             Up2D(chans[i + 1], chans[i], chans[i], temb_dim)
             for i in reversed(range(depth))
@@ -187,12 +192,11 @@ class DiffBackbone2D(nn.Module):
             return checkpoint(module, *args, use_reentrant=False)
         return module(*args)
 
-    def _spatial_attn(self, h: torch.Tensor) -> torch.Tensor:
-        # h: (B, C, H, W) → attend over H*W flattened spatial tokens
+    def _spatial_mlp(self, h: torch.Tensor) -> torch.Tensor:
+        # h: (B, C, H, W) → position-wise MLP over channels at each spatial token
         B, C, H, W = h.shape
         z = h.flatten(2).transpose(1, 2)  # (B, H*W, C)
-        a, _ = self.attn(z, z, z)
-        z = self.attn_norm(z + a)
+        z = self.mlp_norm(z + self.mlp(z))
         return z.transpose(1, 2).view(B, C, H, W)
 
     def _encode(self, x: torch.Tensor, temb: torch.Tensor):
@@ -201,11 +205,11 @@ class DiffBackbone2D(nn.Module):
         for down in self.downs:
             h = self._run(down, h, temb)
             skips.append(h)
-        h = self._spatial_attn(h)
+        h = self._spatial_mlp(h)
         return h, skips
 
     def bottleneck(self, x: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
-        """Return post-attention bottleneck (B, C_b, T_b, F_b)."""
+        """Return post-MLP bottleneck (B, C_b, T_b, F_b)."""
         return self._encode(x, self._temb(t))[0]
 
     def forward_v(self, x: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
