@@ -9,7 +9,7 @@
   "feature_mode": "lob",
   "T_past": 60,
   "label_k": 10,
-  "label_alpha": 2.5e-05,
+  "label_alpha": -1,
   "train_frac": 0.7,
   "val_frac": 0.15,
   "stride": 1,
