@@ -25,46 +25,10 @@ tlob_sin_emb    use sinusoidal PE         (default True; False = learnable)
 
 from __future__ import annotations
 
-
 import torch
 import torch.nn as nn
 
-
-# ── BiN ───────────────────────────────────────────────────────────────────────
-
-
-class BiN(nn.Module):
-    """Bilinear normalisation: convex mix of temporal-normalised and feature-normalised x.
-
-    Applied to (B, T, F) before the linear projection.
-    """
-
-    def __init__(self, T: int, F: int, eps: float = 1e-5) -> None:
-        super().__init__()
-        self.eps = eps
-        self.gamma_t = nn.Parameter(
-            torch.ones(F)
-        )  # per-feature scale (temporal branch)
-        self.beta_t = nn.Parameter(torch.zeros(F))
-        self.gamma_f = nn.Parameter(
-            torch.ones(T)
-        )  # per-timestep scale (feature branch)
-        self.beta_f = nn.Parameter(torch.zeros(T))
-        self.mix = nn.Parameter(torch.zeros(2))  # softmax-mixed combination weight
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # temporal branch: z-score each feature across time
-        mt = x.mean(dim=1, keepdim=True)
-        st = x.std(dim=1, keepdim=True) + self.eps
-        xt = (x - mt) / st * self.gamma_t + self.beta_t
-
-        # feature branch: z-score each timestep across features
-        mf = x.mean(dim=2, keepdim=True)
-        sf = x.std(dim=2, keepdim=True) + self.eps
-        xf = (x - mf) / sf * self.gamma_f[None, :, None] + self.beta_f[None, :, None]
-
-        w = torch.softmax(self.mix, dim=0)
-        return w[0] * xt + w[1] * xf
+from models.modules import BiN, count_parameters as count_parameters  # noqa: F401
 
 
 # ── Positional encoding ───────────────────────────────────────────────────────
@@ -201,5 +165,3 @@ class TLOB(nn.Module):
         return self(batch["x"].to(device).float())
 
 
-def count_parameters(model: nn.Module) -> int:
-    return sum(p.numel() for p in model.parameters() if p.requires_grad)

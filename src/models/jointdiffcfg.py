@@ -31,7 +31,7 @@ from __future__ import annotations
 import torch
 import torch.nn as nn
 
-from models.jointdiff import Down, TimeDoubleConv, Up, sinusoidal_embedding
+from models.modules import Down, TimeDoubleConv, Up, sinusoidal_embedding
 
 
 class JointDiffCFG(nn.Module):
@@ -100,5 +100,4 @@ class JointDiffCFG(nn.Module):
         return logits
 
 
-def count_parameters(model: nn.Module) -> int:
-    return sum(p.numel() for p in model.parameters() if p.requires_grad)
+from models.modules import count_parameters as count_parameters  # re-export

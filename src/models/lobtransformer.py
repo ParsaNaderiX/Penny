@@ -9,6 +9,8 @@ from __future__ import annotations
 import torch
 import torch.nn as nn
 
+from models.modules import count_parameters as count_parameters  # re-export
+
 
 class LOBTransformer(nn.Module):
     """Transformer classifier over a windowed LOB feature matrix."""
@@ -45,5 +47,3 @@ class LOBTransformer(nn.Module):
         return self(batch["x"].to(device).float())
 
 
-def count_parameters(model: nn.Module) -> int:
-    return sum(p.numel() for p in model.parameters() if p.requires_grad)

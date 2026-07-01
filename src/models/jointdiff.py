@@ -9,100 +9,18 @@ at ``t = 0`` (no noise) → ``logits (B, 3)``.
 
 from __future__ import annotations
 
-import math
-
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-
-class BiN(nn.Module):
-    """Bilinear normalisation applied to (B, T, F) before the U-Net.
-
-    Learns a softmax-weighted convex mix of:
-      - temporal branch: z-score each feature across T
-      - feature  branch: z-score each timestep across F
-    """
-
-    def __init__(self, T: int, F: int, eps: float = 1e-5) -> None:
-        super().__init__()
-        self.eps = eps
-        self.gamma_t = nn.Parameter(torch.ones(F))
-        self.beta_t = nn.Parameter(torch.zeros(F))
-        self.gamma_f = nn.Parameter(torch.ones(T))
-        self.beta_f = nn.Parameter(torch.zeros(T))
-        self.mix = nn.Parameter(torch.zeros(2))
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # x: (B, T, F)
-        mt = x.mean(1, keepdim=True)
-        st = x.std(1, keepdim=True) + self.eps
-        xt = (x - mt) / st * self.gamma_t + self.beta_t
-        mf = x.mean(2, keepdim=True)
-        sf = x.std(2, keepdim=True) + self.eps
-        xf = (x - mf) / sf * self.gamma_f[None, :, None] + self.beta_f[None, :, None]
-        w = torch.softmax(self.mix, 0)
-        return w[0] * xt + w[1] * xf
-
-
-def sinusoidal_embedding(t: torch.Tensor, dim: int) -> torch.Tensor:
-    half = dim // 2
-    freqs = torch.exp(
-        -math.log(10000.0) * torch.arange(half, device=t.device) / max(half - 1, 1)
-    )
-    args = t.float().unsqueeze(1) * freqs.unsqueeze(0)
-    emb = torch.cat([torch.cos(args), torch.sin(args)], dim=1)
-    if dim % 2 == 1:
-        emb = F.pad(emb, (0, 1))
-    return emb
-
-
-def _groups(ch: int) -> int:
-    for g in (8, 4, 2, 1):
-        if ch % g == 0:
-            return g
-    return 1
-
-
-class TimeDoubleConv(nn.Module):
-    def __init__(self, in_ch: int, out_ch: int, temb_dim: int) -> None:
-        super().__init__()
-        self.conv1 = nn.Conv2d(in_ch, out_ch, 3, padding=1)
-        self.norm1 = nn.GroupNorm(_groups(out_ch), out_ch)
-        self.temb = nn.Linear(temb_dim, out_ch)
-        self.conv2 = nn.Conv2d(out_ch, out_ch, 3, padding=1)
-        self.norm2 = nn.GroupNorm(_groups(out_ch), out_ch)
-        self.act = nn.SiLU()
-
-    def forward(self, x: torch.Tensor, temb: torch.Tensor) -> torch.Tensor:
-        x = self.act(self.norm1(self.conv1(x)))
-        x = x + self.temb(temb).unsqueeze(-1).unsqueeze(-1)
-        return self.act(self.norm2(self.conv2(x)))
-
-
-class Down(nn.Module):
-    def __init__(self, in_ch: int, out_ch: int, temb_dim: int) -> None:
-        super().__init__()
-        self.pool = nn.MaxPool2d(2)
-        self.conv = TimeDoubleConv(in_ch, out_ch, temb_dim)
-
-    def forward(self, x: torch.Tensor, temb: torch.Tensor) -> torch.Tensor:
-        return self.conv(self.pool(x), temb)
-
-
-class Up(nn.Module):
-    def __init__(self, in_ch: int, skip_ch: int, out_ch: int, temb_dim: int) -> None:
-        super().__init__()
-        self.reduce = nn.Conv2d(in_ch, out_ch, 1)
-        self.conv = TimeDoubleConv(out_ch + skip_ch, out_ch, temb_dim)
-
-    def forward(
-        self, x: torch.Tensor, skip: torch.Tensor, temb: torch.Tensor
-    ) -> torch.Tensor:
-        x = F.interpolate(x, size=skip.shape[-2:], mode="nearest")
-        x = self.reduce(x)
-        x = torch.cat([x, skip], dim=1)
-        return self.conv(x, temb)
+from models.modules import (
+    BiN,
+    Down,
+    TimeDoubleConv,
+    Up,
+    _groups,
+    sinusoidal_embedding,
+)
 
 
 class JointDiffusion(nn.Module):
@@ -190,5 +108,4 @@ class JointDiffusion(nn.Module):
         return logits
 
 
-def count_parameters(model: nn.Module) -> int:
-    return sum(p.numel() for p in model.parameters() if p.requires_grad)
+from models.modules import count_parameters as count_parameters  # re-export
