@@ -13,6 +13,7 @@ import torch
 import torch.nn as nn
 
 from models.modules import (
+    AttentionPool,
     BiN,
     Down,
     TimeDoubleConv,
@@ -52,14 +53,9 @@ class JointDiffusion(nn.Module):
         )
         self.out_conv = nn.Conv2d(base, 1, 1)
         bottleneck = chans[-1]
-        self.classifier = nn.Sequential(
-            nn.AdaptiveAvgPool2d(1),
-            nn.Flatten(),
-            nn.Linear(bottleneck, bottleneck),
-            nn.GELU(),
-            nn.Dropout(config.get("jd_dropout", 0.1)),
-            nn.Linear(bottleneck, 3),
-        )
+        pool_heads = config.get("jd_pool_heads", 4)
+        self.pool = AttentionPool(bottleneck, heads=pool_heads)
+        self.classifier = nn.Linear(bottleneck, 3)
 
         # Consistency-model (EDM) parameters — only used when trained as a
         # consistency model (cm_enabled); forward() is left unchanged so DDPM
@@ -79,7 +75,8 @@ class JointDiffusion(nn.Module):
         for down in self.downs:
             x = down(x, temb)
             skips.append(x)
-        logits = self.classifier(skips[-1])
+        tokens = skips[-1].flatten(2).transpose(1, 2)  # (B, H*W, C)
+        logits = self.classifier(self.pool(tokens))
         for up, skip in zip(self.ups, reversed(skips[:-1])):
             x = up(x, skip, temb)
         return self.out_conv(x), logits
