@@ -126,7 +126,7 @@ def main() -> None:
         logger.error("config not found: {}", config_path)
         sys.exit(1)
     config = json.loads(config_path.read_text())
-    config["cm_enabled"] = True  # consistency-model predict path
+    config["cm_enabled"] = False  # DDPM path (consistency model disabled)
 
     seed = resolve_seed(config)
     config["seed"] = seed
