@@ -114,6 +114,30 @@ def sample_W_batched(
     return W
 
 
+def sample_W_batched_flag(
+    sigma_b: torch.Tensor,  # (B,) Brownian std per sample
+    lambda_b: torch.Tensor,  # (B,) expected jump count per sample
+    jump: JumpParams,
+    generator: torch.Generator | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Like :func:`sample_W_batched` but also returns ``jump_flag = 1{N_t > 0}``.
+
+    Returns ``(W (B,), jump_flag (B,))`` — the realized mixing variance and a float
+    indicator of whether at least one jump occurred (used as the BCE target for the
+    noise-state estimator's jump head).
+    """
+    W = sigma_b.to(torch.float32) ** 2
+    N = torch.poisson(lambda_b.clamp_min(0.0), generator=generator)  # (B,)
+    flag = (N > 0).to(torch.float32)
+    mask = N > 0
+    if mask.any():
+        conc = N[mask] * jump.gamma_shape
+        g = torch._standard_gamma(conc) * jump.gamma_scale
+        W = W.clone()
+        W[mask] = W[mask] + g.to(torch.float32)
+    return W, flag
+
+
 @dataclass
 class GeneralizedScoreTable:
     """Precomputed isotropic score magnitude ``h(r) = E[1/W | r]``.

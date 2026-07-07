@@ -23,6 +23,7 @@ from levy.diffusion.generalized_score import (
     gaussian_score,
     jump_intensity,
     sample_W_batched,
+    sample_W_batched_flag,
 )
 from levy.diffusion.schedules import NoiseSchedule, make_schedule
 
@@ -87,6 +88,27 @@ class ForwardProcess:
         u = self._bcast(scale, x0) * eps
         x_t = self._bcast(a_t, x0) * x0 + u
         return x_t, u
+
+    def add_noise_eps(
+        self, x0: torch.Tensor, t: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Epsilon-parameterized noising for the JumpGate variant.
+
+        Returns ``(x_t, eps, W, jump_flag)`` where ``x_t = a_t x_0 + sqrt(W) eps``,
+        ``eps`` is the standard-normal draw, ``W (B,)`` is the per-sample realized
+        mixing variance and ``jump_flag (B,)`` is ``1{N_t > 0}``.  Gaussian path:
+        ``W = sigma_t^2`` and ``jump_flag = 0`` (so it reduces to plain DDPM).
+        """
+        a_t, sigma_t = self.schedule.gather(t)
+        eps = torch.randn_like(x0)
+        if self.process == "gaussian":
+            W = sigma_t**2
+            jump_flag = torch.zeros_like(W)
+        else:
+            lam = self.lambda_t.to(t.device)[t]
+            W, jump_flag = sample_W_batched_flag(sigma_t, lam, self.jump, self._gen)
+        x_t = self._bcast(a_t, x0) * x0 + self._bcast(torch.sqrt(W), x0) * eps
+        return x_t, eps, W, jump_flag
 
     def score_target(
         self, x_t: torch.Tensor, x0: torch.Tensor, t: torch.Tensor
