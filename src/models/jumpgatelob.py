@@ -45,6 +45,7 @@ from models.jumpgatescore import DiffusionStepMLP, LevelAttention
 from models.jumpgateunet import NoiseStateEstimator
 from models.modules import (
     AttentionPool,
+    BiN,
     count_parameters as count_parameters,  # re-export
     sinusoidal_embedding,
 )
@@ -189,6 +190,16 @@ class JumpGateLOB(nn.Module):
         if self.gate_grad not in ("detach", "flow"):
             raise ValueError(f"gate_grad must be detach|flow, got {self.gate_grad!r}")
 
+        # ---- adaptive input normalization (front-end) -----------------------
+        # BiN normalizes each window (per-feature over T mixed with per-timestep
+        # over F), removing the level/scale non-stationarity between the calendar-day
+        # train/val/test regimes.  Matches the JumpGateUNet front-end.  Applied only
+        # to the trunk's encoder input — the raw noised window still feeds the
+        # diffusion head so the eps target is unchanged.
+        self.bin = (
+            BiN(config["T_past"], F_dim) if config.get("use_bin", False) else None
+        )
+
         # ---- local encoder ---------------------------------------------------
         self.local = config.get("jgl_local", "gru")
         hidden = config.get("jgl_gru_hidden", 64)
@@ -252,6 +263,8 @@ class JumpGateLOB(nn.Module):
     # ---- trunk --------------------------------------------------------------
     def _local(self, x: torch.Tensor) -> torch.Tensor:
         s = x.squeeze(1)  # (B, T, F)
+        if self.bin is not None:
+            s = self.bin(s)
         if self.local == "gru":
             H, _ = self.gru(s)
             return H

@@ -55,5 +55,6 @@
   "jgl_feat_mix": "conv",
   "jgl_feat_heads": 2,
   "jgl_pad_mode": "reflect",
-  "baranchuk_phase1_epochs": 40
+  "baranchuk_phase1_epochs": 40,
+  "use_bin": true
 }
