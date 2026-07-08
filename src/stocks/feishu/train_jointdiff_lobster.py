@@ -95,7 +95,9 @@ def _validate(model, loader, device):
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument(
-        "--config", nargs="?", default="configs/stocks/feishu/jointdiff_lobster_ofi.json"
+        "--config",
+        nargs="?",
+        default="configs/stocks/feishu/jointdiff_lobster_ofi.json",
     )
     args = parser.parse_args()
 
@@ -125,7 +127,7 @@ def main() -> None:
     # Dynamically compile multi-asset LOBSTER databases
     train_ds, val_ds, test_ds, meta = build_datasets_multi(config, data_dir, symbols)
     config["n_features"] = meta["n_features"]
-    
+
     cb = meta["class_balance"]
     logger.info(
         "JointDiffusion [LOBSTER-Mode]  mode={}  symbols={}  n_features={}",
@@ -142,7 +144,7 @@ def main() -> None:
         clip_sample=False,
     )
     model = JointDiffusion(config).to(device)
-    
+
     logger.info(
         "  params={:.2f}M  lambda_trend={}  device={}",
         count_parameters(model) / 1e6,

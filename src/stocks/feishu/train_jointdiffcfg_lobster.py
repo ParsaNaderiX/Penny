@@ -138,7 +138,7 @@ def main() -> None:
     train_ds, val_ds, test_ds, meta = build_datasets_multi(config, data_dir, symbols)
     config["n_features"] = meta["n_features"]
     config["n_assets"] = meta["n_assets"]
-    
+
     cb = meta["class_balance"]
     logger.info(
         "JointDiffCFG [LOBSTER-CFG Mode]  n_assets={}  n_features={}",
