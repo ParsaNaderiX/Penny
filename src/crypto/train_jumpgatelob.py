@@ -180,12 +180,7 @@ def _f1_ce_acc(model, loader, device, max_batches=None):
 
 @torch.no_grad()
 def _validate_noise_state(model, fp, loader, config, device) -> dict:
-    """logW RMSE + jump AUROC + gate-saturation stats on the noised forward pass.
-
-    ``pi_mean``/``pi_std`` are the mean and spread of the gate ``sigma(pi_logit)``:
-    if the gate collapses (mean pinned near 0 or 1, spread ~0) one expert is dead
-    weight and ``gated`` behaves like ``ungated``.
-    """
+    """logW RMSE + jump AUROC on the noised forward pass."""
     model.eval()
     t_max = fp.schedule.num_timesteps
     oracle = config.get("w_conditioning", "none") == "oracle"
@@ -213,12 +208,7 @@ def _validate_noise_state(model, fp, loader, config, device) -> dict:
         if flags.min() == 0 and flags.max() == 1
         else float("nan")
     )
-    return {
-        "logW_rmse": rmse,
-        "jump_auroc": auroc,
-        "pi_mean": float(pis.mean()),
-        "pi_std": float(pis.std()),
-    }
+    return {"logW_rmse": rmse, "jump_auroc": auroc}
 
 
 @torch.no_grad()
@@ -413,7 +403,6 @@ def main() -> None:
             train_f1,
             train_f1 - val_f1,
             f" | logW_rmse={row['logW_rmse']:.3f} auroc={row['jump_auroc']:.3f}"
-            f" pi={row['pi_mean']:.3f}±{row['pi_std']:.3f}"
             if do_diff
             else "",
         )
