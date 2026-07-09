@@ -39,7 +39,7 @@
   "mu_W": 0.1,
   "jg_gphi_hidden": 64,
   "cls_dropout": 0.2,
-  "label_smoothing": 0.2,
+  "label_smoothing": 0.1,
   "mu_jump": 0.05,
   "jump_rv_k": 4.0,
   "lambda_diff": 1.0,
