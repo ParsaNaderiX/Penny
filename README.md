@@ -14,8 +14,9 @@ established **discriminative baselines** alongside the joint models for comparis
 
 - **Joint generative–discriminative models:** JointDiT (Diffusion Transformer, with
   five training objectives — DDPM, consistency, t-EDM, drift, Lévy — plus a two-phase
-  probe), JumpGateLOB (Lévy jump-aware, feature-only inference), and AlphaStableLOB
-  (JumpGateLOB's trunk with a genuine α-stable, power-law-tailed forward process).
+  probe), JumpGateLOB (jump-diffusion score matching + noise-consistent classification,
+  feature-only inference), and AlphaStableLOB (the same trunk with a genuine α-stable,
+  power-law-tailed forward process).
 - **Discriminative baselines:** DeepLOB, CTABL, BiN-CTABL, TLOB, DLA, Axial-LOB.
 
 See **[docs/models](docs/models/README.md)** for every model and **[docs/data](docs/data/README.md)**

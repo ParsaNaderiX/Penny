@@ -1,38 +1,31 @@
-"""JumpGateLOB: a Lévy, W-aware joint diffusion-classifier with ONE temporal-attention
-layer, built for feature-only LOB trend inference.
+"""JumpGateLOB: jump-diffusion score-matching joint classifier for noisy LOB windows.
 
-Instead of a deep stack of jointly-coupled residual blocks, the *global* timestep
-coupling is a **single** temporal self-attention layer over ``T`` on top of a
-**local** recurrent (or conv) encoder — the rest of the capacity goes into a small
-grid diffusion head.
+A deliberately **simple** joint diffusion-classifier (same shape as
+:class:`~models.alphastablelob.AlphaStableLOB`): a shared trunk — optional ``BiN`` →
+(bi)GRU local encoder → **one** DiT-style temporal self-attention layer — feeding a
+**trend head** (the only path used at inference) and a single-channel **score head**
+(a training-time auxiliary).  No noise-state estimator, no gated experts, no
+``w_conditioning`` — the earlier gated variant of this architecture is preserved in
+git history.
 
-Shared trunk (used by both losses; run once per pass):
+What makes it the *jump-diffusion* model is the training procedure
+(``crypto.train_jumpgatelob``), built for LOB windows that are **noisy and contain
+jumps**:
 
-  1. **local encoder** — a (bi)GRU over the window gives per-timestep, order-aware
-     context ``H0 (B, T, D)`` (``D = 2*hidden`` when bidirectional).  A GRU is fine
-     because the window ends at the prediction point and the label lives strictly
-     outside it, so bidirectionality leaks nothing.  ``jgl_local="conv"`` swaps in a
-     causal-free temporal conv stack.
-  2. **one temporal self-attention layer** over ``T`` with sinusoidal positional
-     encoding — the single global-coupling layer (a DiT block: adaLN-Zero + MHA +
-     MLP).  Do **not** stack more unless an ablation justifies it.
+  1. **Jump-diffusion forward process** (``src/levy``): the additive noise is
+     ``u = √W·ξ`` with ``W = σ_t² + Σ_k S_k`` — Brownian variance plus
+     compound-Poisson gamma jumps — so the trunk is trained on perturbations that
+     look like market microstructure noise *and* discrete jumps.
+  2. **Generalized denoising score matching** (Baule 2025): the score head regresses
+     the *true* score of that non-Gaussian kernel, ``∇log q(x_t|x₀) = −u·h(|u|)``
+     with ``h`` a precomputed 1-D table — not ε-prediction, not a Gaussian score.
+  3. **Noise-consistent classification**: the trend head is additionally trained on
+     jump-noised low-``t`` windows (CE + KL-consistency to its own clean prediction),
+     so the *inference path itself* is robust to noise and jumps — the denoising
+     auxiliary alone only regularises the trunk.
 
-  ``(t, logŴ)`` are injected via **adaLN-Zero** (identity at init) from a conditioning
-  vector ``c = MLP(emb(t) [, emb(logŴ)])`` selected by ``w_conditioning``.
-
-Two heads share the trunk:
-
-  * **trend head** — attention-pool over ``T`` → 3 logits.  Feature-only inference
-    runs *only* the trunk + this head on the clean window (no reverse sampling).
-  * **diffusion head** — a small flat, constant-``(T,F)`` grid net (no U-Net pooling):
-    each block mixes **book levels** over ``F`` (cross-level attention *or* a conv
-    with reflect/replicate padding — never circular), injects the per-timestep trunk
-    context ``H``, and is adaLN-Zero conditioned on ``(t, logŴ)``.  ε-prediction with
-    **gated experts** ``ε̂ = (1−π)ε₀ + π·ε₁``, ``π = σ(π_logit)``.
-
-Lévy machinery kept from the JumpGate family: ``NoiseStateEstimator`` (``g_phi``) →
-``(logŴ, π_logit)`` (normal variance-mean mixture: Gaussian-given-``W`` with jumps
-gating ``π``); ``recover_score = −ε/W``; ``w_conditioning ∈ {none, inferred, oracle}``.
+Inference contract matches every other crypto model: ``predict(batch, device) →
+logits (B, 3)`` from a single clean-window pass (no sampling loop).
 """
 
 from __future__ import annotations
@@ -44,9 +37,7 @@ import torch.nn.functional as F
 from models.modules import (
     AttentionPool,
     BiN,
-    DiffusionStepMLP,
     LevelAttention,
-    NoiseStateEstimator,
     count_parameters as count_parameters,  # re-export
     sinusoidal_embedding,
 )
@@ -94,7 +85,7 @@ class TemporalAttnBlock(nn.Module):
 
 class DiffBlock(nn.Module):
     """Grid diffusion block: feature-axis mixing over ``F`` + trunk-context injection,
-    adaLN-Zero conditioned on ``(t, logŴ)``.  Operates on ``(B, C, T, F)``."""
+    adaLN-Zero conditioned on ``t``.  Operates on ``(B, C, T, F)``."""
 
     def __init__(
         self,
@@ -131,8 +122,8 @@ class DiffBlock(nn.Module):
         return x + gate.view(v) * h
 
 
-class DiffHead(nn.Module):
-    """Flat grid ε-net conditioned on the trunk context, with gated experts."""
+class ScoreHead(nn.Module):
+    """Flat grid net predicting the jump-diffusion score ``ŝ (B, 1, T, F)``."""
 
     def __init__(
         self,
@@ -143,7 +134,6 @@ class DiffHead(nn.Module):
         feat_mix: str,
         feat_heads: int,
         pad_mode: str,
-        gated_experts: bool,
     ) -> None:
         super().__init__()
         self.input_projection = nn.Conv2d(1, channels, 1)
@@ -151,26 +141,19 @@ class DiffHead(nn.Module):
             DiffBlock(channels, cond_dim, ctx_dim, feat_mix, feat_heads, pad_mode)
             for _ in range(n_blocks)
         )
-        self.out0 = nn.Conv2d(channels, 1, 1)
-        self.out1 = nn.Conv2d(channels, 1, 1) if gated_experts else None
-        nn.init.zeros_(self.out0.weight)
-        if self.out1 is not None:
-            nn.init.zeros_(self.out1.weight)
+        self.out = nn.Conv2d(channels, 1, 1)  # single-channel score
+        nn.init.zeros_(self.out.weight)
+        nn.init.zeros_(self.out.bias)
 
-    def forward(self, x_t, c, H, pi=None):
+    def forward(self, x_t, c, H):
         x = self.input_projection(x_t)  # (B, C, T, F)
         for blk in self.blocks:
             x = blk(x, c, H)
-        eps0 = self.out0(x)
-        if self.out1 is not None and pi is not None:
-            eps1 = self.out1(x)
-            v = (-1, 1, 1, 1)
-            return (1.0 - pi).view(v) * eps0 + pi.view(v) * eps1
-        return eps0
+        return self.out(x)  # (B, 1, T, F)
 
 
 class JumpGateLOB(nn.Module):
-    """(bi)GRU + one temporal-attention layer trunk, grid diffusion head + trend head."""
+    """(bi)GRU + one temporal-attention trunk; trend head + jump-diffusion score head."""
 
     family = "joint_diffusion"
 
@@ -181,22 +164,7 @@ class JumpGateLOB(nn.Module):
         self.temb_dim = temb_dim
         self.F = F_dim
 
-        self.w_conditioning = config.get("w_conditioning", "none")
-        if self.w_conditioning not in ("none", "inferred", "oracle"):
-            raise ValueError(
-                f"w_conditioning must be none|inferred|oracle, got {self.w_conditioning!r}"
-            )
-        self.gated_experts = bool(config.get("gated_experts", False))
-        self.gate_grad = config.get("gate_grad", "detach")
-        if self.gate_grad not in ("detach", "flow"):
-            raise ValueError(f"gate_grad must be detach|flow, got {self.gate_grad!r}")
-
         # ---- adaptive input normalization (front-end) -----------------------
-        # BiN normalizes each window (per-feature over T mixed with per-timestep
-        # over F), removing the level/scale non-stationarity between the calendar-day
-        # train/val/test regimes.  Matches the JumpGateUNet front-end.  Applied only
-        # to the trunk's encoder input — the raw noised window still feeds the
-        # diffusion head so the eps target is unchanged.
         self.bin = (
             BiN(config["T_past"], F_dim) if config.get("use_bin", False) else None
         )
@@ -229,12 +197,10 @@ class JumpGateLOB(nn.Module):
             raise ValueError(f"jgl_local must be gru|conv, got {self.local!r}")
         self.D = D
 
-        # ---- conditioning + noise-state -------------------------------------
-        self.gphi = NoiseStateEstimator(
-            F_dim, temb_dim, hidden=config.get("jg_gphi_hidden", 64)
+        # ---- timestep conditioning c = MLP(emb(t)) --------------------------
+        self.time_mlp = nn.Sequential(
+            nn.Linear(temb_dim, temb_dim), nn.SiLU(), nn.Linear(temb_dim, temb_dim)
         )
-        # cond vector c = MLP(emb(t) [, emb(logW)]) -> temb_dim, feeds every adaLN.
-        self.cond_mlp = DiffusionStepMLP(temb_dim, temb_dim, self.w_conditioning)
 
         # ---- one temporal-attention layer -----------------------------------
         self.temporal = TemporalAttnBlock(
@@ -249,8 +215,8 @@ class JumpGateLOB(nn.Module):
         self.cls_dropout = nn.Dropout(config.get("cls_dropout", 0.0))
         self.classifier = nn.Linear(D, 3)
 
-        # ---- diffusion head --------------------------------------------------
-        self.diff_head = DiffHead(
+        # ---- score head ------------------------------------------------------
+        self.score_head = ScoreHead(
             channels=config.get("jgl_diff_channels", 16),
             cond_dim=temb_dim,
             ctx_dim=D,
@@ -258,7 +224,6 @@ class JumpGateLOB(nn.Module):
             feat_mix=config.get("jgl_feat_mix", "conv"),
             feat_heads=config.get("jgl_feat_heads", 2),
             pad_mode=config.get("jgl_pad_mode", "reflect"),
-            gated_experts=self.gated_experts,
         )
 
     # ---- trunk --------------------------------------------------------------
@@ -272,70 +237,46 @@ class JumpGateLOB(nn.Module):
         h = self.embed(s).transpose(1, 2)  # (B, D, T)
         return self.tconv(h).transpose(1, 2)  # (B, T, D)
 
-    def trunk(self, x: torch.Tensor, t: torch.Tensor, logW_oracle: torch.Tensor | None):
-        """Return ``(H (B,T,D), logW_hat (B,), pi_logit (B,), c (B,temb_dim))``."""
-        temb = sinusoidal_embedding(t, self.temb_dim)
-        logW_hat, pi_logit = self.gphi(x, temb)
-        c = self.cond_mlp(t, logW_hat, logW_oracle)
+    def _cond(self, t: torch.Tensor) -> torch.Tensor:
+        return self.time_mlp(sinusoidal_embedding(t, self.temb_dim))
+
+    def trunk(self, x: torch.Tensor, t: torch.Tensor):
+        """Return ``(H (B,T,D), c (B,temb_dim))``."""
+        c = self._cond(t)
         H0 = self._local(x)  # (B, T, D)
         T = H0.shape[1]
         pos = sinusoidal_embedding(torch.arange(T, device=x.device), self.D).unsqueeze(
             0
         )
         H = self.temporal(H0 + pos, c)
-        return H, logW_hat, pi_logit, c
+        return H, c
 
     def _trend_logits(self, H: torch.Tensor) -> torch.Tensor:
         return self.classifier(self.cls_dropout(self.pool(H)))
 
     # ---- task-specific passes (training uses these separately) --------------
     def classify(self, x: torch.Tensor) -> torch.Tensor:
-        """Trend logits from the *clean* window at ``t = 0`` (matches inference)."""
+        """Trend logits at ``t = 0`` — used for clean windows at inference *and* for
+        jump-noised windows in the noise-consistency loss (deployment never knows the
+        noise level, so the classifier never conditions on ``t``)."""
         t = torch.zeros(x.shape[0], dtype=torch.long, device=x.device)
-        H, _, _, _ = self.trunk(x, t, None)
+        H, _ = self.trunk(x, t)
         return self._trend_logits(H)
 
-    def diffuse(
-        self,
-        x_t: torch.Tensor,
-        t: torch.Tensor,
-        logW_oracle: torch.Tensor | None = None,
-    ):
-        """ε-prediction on the *noised* window.  Returns ``(eps_hat, logW_hat, pi_logit)``."""
-        H, logW_hat, pi_logit, c = self.trunk(x_t, t, logW_oracle)
-        pi = None
-        if self.gated_experts:
-            pi = torch.sigmoid(pi_logit)
-            if self.gate_grad == "detach":
-                pi = pi.detach()
-        eps_hat = self.diff_head(x_t, c, H, pi)
-        return eps_hat, logW_hat, pi_logit
+    def score(self, x_t: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
+        """Predict the jump-diffusion score on the noised window at timestep ``t``."""
+        H, c = self.trunk(x_t, t)
+        return self.score_head(x_t, c, H)
 
-    def forward(
-        self,
-        x_t: torch.Tensor,
-        t: torch.Tensor,
-        logW_oracle: torch.Tensor | None = None,
-    ):
-        """Convenience joint pass on a single input (eval/compat):
-        ``(eps_hat, logits, logW_hat, pi_logit)``."""
-        H, logW_hat, pi_logit, c = self.trunk(x_t, t, logW_oracle)
+    def forward(self, x_t: torch.Tensor, t: torch.Tensor):
+        """Joint pass: ``(ŝ, logits)``."""
+        H, c = self.trunk(x_t, t)
         logits = self._trend_logits(H)
-        pi = None
-        if self.gated_experts:
-            pi = torch.sigmoid(pi_logit)
-            if self.gate_grad == "detach":
-                pi = pi.detach()
-        eps_hat = self.diff_head(x_t, c, H, pi)
-        return eps_hat, logits, logW_hat, pi_logit
-
-    @staticmethod
-    def recover_score(eps_hat: torch.Tensor, W_hat: torch.Tensor) -> torch.Tensor:
-        v = (-1,) + (1,) * (eps_hat.dim() - 1)
-        return -eps_hat / W_hat.reshape(v)
+        s_hat = self.score_head(x_t, c, H)
+        return s_hat, logits
 
     def trunk_parameters(self):
-        """All params except the trend head — for the Baranchuk phase-2 freeze."""
+        """All params except the trend head (for a frozen-trunk phase-2 probe)."""
         head = set(map(id, self.pool.parameters())) | set(
             map(id, self.classifier.parameters())
         )
