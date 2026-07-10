@@ -14,7 +14,8 @@ established **discriminative baselines** alongside the joint models for comparis
 
 - **Joint generative–discriminative models:** JointDiT (Diffusion Transformer, with
   five training objectives — DDPM, consistency, t-EDM, drift, Lévy — plus a two-phase
-  probe) and JumpGateLOB (Lévy jump-aware, feature-only inference).
+  probe), JumpGateLOB (Lévy jump-aware, feature-only inference), and StableLOB
+  (JumpGateLOB's trunk with the improved-DDPM cosine + learned-variance recipe).
 - **Discriminative baselines:** DeepLOB, CTABL, BiN-CTABL, TLOB, DLA, Axial-LOB.
 
 See **[docs/models](docs/models/README.md)** for every model and **[docs/data](docs/data/README.md)**
@@ -82,6 +83,9 @@ uv run python -m crypto.train_jointdit_levy  configs/crypto/nobitex/jointditlevy
 
 # Lévy jump-aware joint model (feature-only inference)
 uv run python -m crypto.train_jumpgatelob    configs/crypto/nobitex/jumpgatelob/btcirt_ofi_k10.json
+
+# improved-DDPM joint model (cosine schedule + learned variance + hybrid loss)
+uv run python -m crypto.train_stablelob      configs/crypto/nobitex/stablelob/btcirt_ofi_k10.json
 ```
 
 Each run builds/loads the feature cache, trains with early stopping, restores the best
@@ -122,7 +126,8 @@ Per-topic files:
 - Models: [DeepLOB](docs/models/deeplob.md) · [CTABL](docs/models/ctabl.md) ·
   [BiN-CTABL](docs/models/binctabl.md) · [TLOB](docs/models/tlob.md) ·
   [DLA](docs/models/dla.md) · [Axial-LOB](docs/models/axiallob.md) ·
-  [JointDiT](docs/models/jointdit.md) · [JumpGateLOB](docs/models/jumpgatelob.md)
+  [JointDiT](docs/models/jointdit.md) · [JumpGateLOB](docs/models/jumpgatelob.md) ·
+  [StableLOB](docs/models/stablelob.md)
 
 ## Repository layout
 
