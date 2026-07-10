@@ -24,10 +24,11 @@ def zero_baseline(x: torch.Tensor) -> torch.Tensor:
 def mean_baseline(dataset: Dataset, n_samples: int = 512, seed: int = 42) -> torch.Tensor:
     """Elementwise mean window over a random sample of the dataset.
 
-    Returns a single ``(1, T, F)`` tensor (unbatched) representing the
-    "average" window, used as an alternative baseline to the zero window —
-    useful when a feature's zero point isn't a neutral reading (e.g. OFI is
-    zero-centered already, but trade-count/volume features are not).
+    Returns a single ``(1, 1, T, F)`` tensor (batch size 1, matching the
+    model's ``(B, 1, T, F)`` input) representing the "average" window, used
+    as an alternative baseline to the zero window — useful when a feature's
+    zero point isn't a neutral reading (e.g. OFI is zero-centered already,
+    but trade-count/volume features are not).
     """
     rng = np.random.default_rng(seed)
     idx = rng.choice(len(dataset), size=min(n_samples, len(dataset)), replace=False)
@@ -35,4 +36,4 @@ def mean_baseline(dataset: Dataset, n_samples: int = 512, seed: int = 42) -> tor
     for i in idx:
         x = dataset[int(i)]["x"]  # (1, T, F)
         acc = x.clone() if acc is None else acc + x
-    return acc / len(idx)
+    return (acc / len(idx)).unsqueeze(0)  # (1, 1, T, F)
