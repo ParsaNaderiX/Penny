@@ -173,8 +173,8 @@ def _train_epoch(
 
         tot += loss.item()
         clsm += cls_loss.item()
-        scm += float(score_loss)
-        robm += float(rob_loss)
+        scm += score_loss.item()
+        robm += rob_loss.item()
         n += 1
     n = max(n, 1)
     return {"total": tot / n, "cls": clsm / n, "score": scm / n, "robust": robm / n}
