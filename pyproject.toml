@@ -9,6 +9,7 @@ description = "LOB direction forecasting on crypto (Binance, Nobitex) and equity
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
+    "captum>=0.7.0",
     "dvc[s3]>=3.56.0",
     "loguru>=0.7.3",
     "numpy>=1.26.0,<2.0.0",
@@ -65,7 +66,7 @@ penny-stocks-diffclf         = "stocks.feishu.train_diffclf:main"
 
 
 [tool.hatch.build.targets.wheel]
-packages = ["src/crypto", "src/models", "src/stocks"]
+packages = ["src/crypto", "src/models", "src/stocks", "src/xai"]
 
 [tool.uv.sources]
 torch = [
