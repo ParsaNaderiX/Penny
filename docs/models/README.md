@@ -71,3 +71,10 @@ The diffusion machinery behind the joint models:
 
 These are documented in context within [jointdit.md](jointdit.md) and
 [jumpgatelob.md](jumpgatelob.md).
+
+## Explainability
+
+CTABL, DLA, JointDiT, and JumpGateLOB each have a dedicated XAI method fitted
+to their architecture (native attention/gate readout), plus a shared
+Integrated Gradients / GradientSHAP baseline for cross-model comparison —
+see [../xai/README.md](../xai/README.md).
