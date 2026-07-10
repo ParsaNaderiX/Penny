@@ -101,7 +101,7 @@ def _train_epoch(model, diff, loader, optimizer, lr_sched, config, device, do_di
 
         tot += loss.item()
         clsm += cls_loss.item()
-        difm += float(diff_loss)
+        difm += diff_loss.item()
         vlbm += parts["vlb"]
         n += 1
     n = max(n, 1)
